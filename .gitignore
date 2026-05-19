@@ -26,3 +26,6 @@ __pycache__/
 # Big local artifacts (not for upstream)
 *.zip
 稳定版*.zip
+
+# Local-only working docs (session digests, plan scratch, etc.)
+docs/

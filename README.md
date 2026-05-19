@@ -122,27 +122,51 @@ Flags:
 | `--iter N` | 2 | max iterations (Analyze → Plan → Execute → QA = 1 iter) |
 | `--parallel N` | 4 | concurrent Executors per iteration |
 | `--no-qa` | off | skip the QA stage (faster, but no failing-test guardrails added) |
+| `--reanalyze-every N` | 0 | re-run Analyzer every N iters (essence/audience pinned); 0 disables |
+| `--qa-wontfix-after N` | 3 | retire a QA bug after N failed fix attempts; 0 disables |
 | `-v` | off | verbose logs |
 
 Example:
 
 ```bash
-python run.py ../werewolf-demo --iter 3 --parallel 2
+python run.py ../werewolf-demo --iter 3 --parallel 2 \
+    --reanalyze-every 4 --qa-wontfix-after 3
 ```
 
 Artifacts land in `<target>/.d2p/run-<timestamp>/`:
 
 ```
 .d2p/run-2026-05-18T12-00-00/
-├── analysis.json          # competitor research + capability matrix
-├── plan.json              # Task list with file-level intent
-├── execution-iter-1.json  # per-Executor outputs
-├── qa-iter-1.json         # failing tests + fix dispatches
-└── ...
+├── analysis.json            # competitor research + capability matrix
+├── analysis_iter<N>.json    # re-analysis snapshots (if --reanalyze-every > 0)
+├── plan_iter<N>.json        # Task list with file-level intent
+├── exec_iter<N>.json        # per-Executor outputs
+├── qa_iter<N>.json          # failing tests + fix dispatches
+├── qa_fix_iter<N>.json      # per-fix-Executor outputs
+├── qa_rerun_iter<N>.json    # full corpus re-run after fixes (regression sweep)
+├── qa_regressions_iter<N>.json
+├── iter<N>_changes.md       # human-readable digest of what moved this iter
+└── summary.json             # final analysis + open bugs + cumulative LLM usage
 ```
 
 The demo's own `tests/d2p_qa/` directory grows with each run — that's the
-permanent regression corpus.
+permanent regression corpus. Each entry in its `_meta.json` carries
+`attempts`, `first_seen_iter`, and `status` (`open` / `fixed` / `wontfix`),
+so retired bugs stay visible without re-burning fix budget on them.
+
+### Iteration digests
+
+After every iteration the orchestrator writes `iter<N>_changes.md` — a
+skim-friendly view of what actually moved that round:
+
+- the Planner's rationale
+- feature tasks (done/failed) with files touched
+- QA fixes (done/failed) with the test path each one targeted
+- bugs: new vs fixed vs still-open vs retired
+- a "Files touched" rollup
+- the cumulative LLM-usage line (calls, cost, cache hit ratio)
+
+That last line means you don't have to spelunk JSON to know what a run cost.
 
 ---
 
@@ -150,17 +174,17 @@ permanent regression corpus.
 
 | File | Lines | Role |
 |---|---:|---|
-| `run.py` | 30 | CLI entry |
-| `d2p/orchestrator.py` | 388 | Closed-loop driver, sandbox, rollback, parallelism |
+| `run.py` | 40 | CLI entry |
+| `d2p/orchestrator.py` | ~570 | Closed-loop driver, sandbox, rollback, parallelism, iter digests |
 | `d2p/agents.py` | 875 | Analyzer / Planner / Executor LLM agents |
-| `d2p/qa.py` | 594 | QA agent (probe → failing test → fix dispatch) |
-| `d2p/providers/` | ~600 | minimax / claude / claude-cli / codex backends + role router |
-| `d2p/lang/` | ~200 | Language adapters (Python + JS health probes) |
+| `d2p/qa.py` | ~640 | QA agent (probe → failing test → fix dispatch, retirement) |
+| `d2p/providers/` | ~750 | minimax / claude / claude-cli / codex backends, role router, usage ledger |
+| `d2p/lang/` | ~250 | Language adapters (Python + JS health probes, 3.10+ picker) |
 | `d2p/fs.py` | 91 | Sandbox file ops + snapshot/restore |
 | `d2p/health.py` | 25 | Module-level import probe |
 | `d2p/symbols.py` | 60 | Symbol map for the analyzer's project view |
 | `d2p/models.py` | 78 | Dataclasses for Task / Feature / ExecutionResult etc. |
-| **Total core** | **~2.5k LOC** | |
+| **Total core** | **~2.8k LOC** | |
 
 For comparison: the older sibling project [MatrixOmnix](https://github.com/) (`demo2project`) hard-codes
 60+ gap detectors + per-detector planner cases + per-task executor handlers,
@@ -172,10 +196,12 @@ where the agents themselves do that work.
 ## Provider details
 
 `d2p/providers/__init__.py` ships a `RoleRouter` that picks a model per role
-(executor / analyzer / planner / qa) so you can run cheap fast models on the
-hot path and reasoning-grade models on Analyzer / Planner / QA:
+(**executor / fix / analyzer / planner / qa**) so you can run cheap fast
+models on the hot path and reasoning-grade models on Analyzer / Planner /
+QA. The `fix` role is split from `executor` because empirically QA-bug
+fixes need a stronger model than feature edits — see "Sweet spot" below.
 
-| Provider | executor default | analyzer / planner / qa default |
+| Provider | executor / fix default | analyzer / planner / qa default |
 |---|---|---|
 | `minimax` | `MiniMax-M2.7-highspeed` | same (single-model) |
 | `claude` | `claude-haiku-4-5` | `claude-opus-4-7` |
@@ -185,8 +211,46 @@ hot path and reasoning-grade models on Analyzer / Planner / QA:
 Override any role via env:
 
 ```bash
-D2P_ROLE_EXECUTOR_MODEL=gpt-4o-mini   D2P_ROLE_ANALYZER_MODEL=gpt-4o   python run.py ...
+D2P_ROLE_EXECUTOR_MODEL=gpt-4o-mini  D2P_ROLE_FIX_MODEL=gpt-4o \
+D2P_ROLE_ANALYZER_MODEL=gpt-4o       python run.py ...
 ```
+
+### Sweet spot (empirical)
+
+```bash
+D2P_PROVIDER=claude-cli D2P_ROLE_FIX_MODEL=sonnet python run.py <demo> --iter 2
+```
+
+Haiku is fine for feature edits (10× cheaper than Opus and fast enough);
+fixes need Sonnet to climb past ~0% success on harder bugs. Opus is
+reserved for Analyzer / Planner / QA where reasoning quality dominates.
+
+### Cost & cache visibility
+
+Every provider call routes through a shared `UsageAccumulator`. At the
+end of a run, `summary.json` carries a `usage` block with totals plus a
+per-role breakdown:
+
+```json
+"usage": {
+  "total_calls": 29,
+  "total_cost_usd": 1.3612,
+  "cache_hit_ratio": 0.683,
+  "per_role": {
+    "executor:haiku": { "calls": 12, "input": 120, "output": 28536,
+                        "cache_creation": 119353, "cache_read": 321363,
+                        "cost_usd": 0.3241 },
+    "fix:haiku":      { "calls": 12, "cost_usd": 0.4606, ... },
+    ...
+  }
+}
+```
+
+`cache_hit_ratio = cache_read / (cache_read + cache_creation)` — higher is
+cheaper and faster. The `claude-cli` prompt layout is intentionally
+stable-prefix (`=== System ===` → `=== Role ===` → `=== User ===` →
+`=== Call options ===`) so per-call variables sink to the trailing block
+and the SDK's prompt cache can read the prefix instead of re-encoding it.
 
 ---
 
@@ -199,11 +263,27 @@ After a run, the **target demo** (not this repo) typically gains:
 - A growing `tests/d2p_qa/` directory of unittest files — each one captures
   a real bug found by the QA agent. The test names document the bug.
 - A `.d2p/` directory with the run audit trail (analyzer report, plan,
-  per-executor outputs, qa logs).
+  per-executor outputs, QA logs, **per-iter markdown digests**, and a final
+  `summary.json` with cumulative cost/cache stats).
 
 If a write would break a module that previously imported clean, or break a
 demo-author test that previously passed, **the orchestrator rolls back
 automatically** — your demo can never be left in a regressed state.
+
+### QA bug lifecycle
+
+Each entry in `tests/d2p_qa/_meta.json` tracks:
+
+| field | meaning |
+|---|---|
+| `status` | `open` (failing, will retry) / `fixed` (passing) / `wontfix` (retired) |
+| `attempts` | how many fix tasks were dispatched against this bug |
+| `first_seen_iter` | iteration that first discovered the bug |
+
+After `--qa-wontfix-after N` failed attempts the bug flips to `wontfix`:
+the test stays in the corpus (so future runs notice if it accidentally
+turns green — the system will flip it back to `fixed`), but the
+orchestrator stops dispatching the same broken fix forever.
 
 ---
 
