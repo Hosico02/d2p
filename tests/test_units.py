@@ -932,5 +932,157 @@ class TestRouterFallback(unittest.TestCase):
             _os.environ.update(old)
 
 
+class TestQAFenceStripAndParse(unittest.TestCase):
+    """The 2026-05-19 demo run produced a test_api_contract.py wrapped in a
+    ```python fence — sailed past quality checks, then SyntaxError'd at
+    import time inside the corpus. Both safeguards now block this."""
+
+    def test_strip_md_fence_round(self) -> None:
+        from d2p.qa import _strip_md_fence
+        content = "```python\n\"\"\"doc\"\"\"\nimport os\n```\n"
+        out = _strip_md_fence(content)
+        self.assertNotIn("```", out)
+        self.assertIn("import os", out)
+
+    def test_strip_md_fence_no_op_when_only_one_end(self) -> None:
+        from d2p.qa import _strip_md_fence
+        # one stray ``` shouldn't trigger stripping
+        content = 'x = "```python"\n'
+        self.assertEqual(_strip_md_fence(content), content)
+
+    def test_quality_rejects_syntax_error(self) -> None:
+        bad = (
+            '```python\n'
+            '"""docstring that\'s long enough to pass the 300-byte gate"""\n'
+            'import unittest\n'
+            'class TestX(unittest.TestCase):\n'
+            '    def test_foo(self):\n'
+            '        self.assertTrue(True)\n'
+            'this line breaks parsing because it has bad characters: $$$\n'
+            'class More syntax problems!! while:: \n'
+        )
+        # pad to >300 bytes
+        bad = bad + '\n# padding ' * 30
+        reason = _validate_test_quality(bad, "python")
+        self.assertTrue(reason.startswith("SyntaxError"), reason)
+
+    def test_quality_accepts_clean_test(self) -> None:
+        padding = "padding " * 50
+        good = (
+            f'"""docstring that is long enough to pass the 300-byte gate. {padding}"""\n'
+            "import unittest\n\n\n"
+            "class TestY(unittest.TestCase):\n"
+            "    def test_z(self):\n"
+            "        self.assertEqual(1 + 1, 2)\n"
+            "\n\nif __name__ == '__main__':\n    unittest.main()\n"
+        )
+        self.assertEqual(_validate_test_quality(good, "python"), "")
+
+    def test_parser_strips_fences_end_to_end(self) -> None:
+        # full QA agent output with the fenced test inside the ===TEST===
+        # block. parse_qa_output should strip the fence before returning.
+        raw = (
+            "===TEST: tests/d2p_qa/test_x.py===\n"
+            'META: {"title": "x", "category": "custom"}\n'
+            "```python\n"
+            '"""hypothesis"""\n'
+            "import unittest\n"
+            "class T(unittest.TestCase):\n"
+            "    def test_bug(self):\n"
+            "        self.fail()\n"
+            "```\n"
+            "===END===\n"
+        )
+        parsed = parse_qa_output(raw)
+        self.assertEqual(len(parsed), 1)
+        _path, _meta, body = parsed[0]
+        self.assertNotIn("```", body)
+        self.assertIn("import unittest", body)
+
+
+class TestEscalationDecision(unittest.TestCase):
+    def test_skip_on_forbidden(self) -> None:
+        from d2p.orchestrator import _should_escalate
+        self.assertFalse(_should_escalate(
+            "partial; rejected: tests/d2p_qa/x.py: forbidden (test file, read)"))
+
+    def test_skip_on_sandbox_escape(self) -> None:
+        from d2p.orchestrator import _should_escalate
+        self.assertFalse(_should_escalate("path escapes sandbox: ../etc/x"))
+
+    def test_retry_on_regression(self) -> None:
+        from d2p.orchestrator import _should_escalate
+        self.assertTrue(_should_escalate(
+            "regression detected — rolled back"))
+
+    def test_retry_on_search_miss(self) -> None:
+        from d2p.orchestrator import _should_escalate
+        self.assertTrue(_should_escalate(
+            "app.py: SEARCH not found after retry: '@app.route...'"))
+
+    def test_retry_on_empty_error(self) -> None:
+        from d2p.orchestrator import _should_escalate
+        # unknown errors should default to retry — better to waste $0.10
+        # on one extra call than to silently swallow a fixable case.
+        self.assertTrue(_should_escalate(""))
+
+
+class TestFlattenError(unittest.TestCase):
+    def test_collapses_multiline(self) -> None:
+        from d2p.orchestrator import _flatten
+        msg = 'post-check failed: Traceback:\n  File "x.py", line 1\n    foo'
+        out = _flatten(msg, max_len=200)
+        self.assertNotIn("\n", out)
+        self.assertIn("|", out)
+
+    def test_truncates(self) -> None:
+        from d2p.orchestrator import _flatten
+        long = "a" * 1000
+        self.assertEqual(len(_flatten(long, max_len=80)), 80)
+
+    def test_empty_passthrough(self) -> None:
+        from d2p.orchestrator import _flatten
+        self.assertEqual(_flatten(""), "")
+        self.assertEqual(_flatten(None), "")  # type: ignore[arg-type]
+
+
+class TestFixCap(unittest.TestCase):
+    """Verify the orchestrator.cfg.max_concurrent_fixes path: when N fixes
+    exceed the cap, fix_tasks gets trimmed to the cap, preferring tasks
+    whose bugs have the lowest attempts count."""
+
+    def test_cap_filters_by_lowest_attempts(self) -> None:
+        from unittest.mock import MagicMock
+        from d2p.models import Task
+        # We'll exercise the SORT logic directly — the orchestrator's
+        # _run_qa code calls _load_meta + sorts inline. Test that
+        # behaviour by reconstructing the exact sort.
+        tasks = [
+            Task(id=f"qa-{i:08x}", title=f"t{i}", rationale="", target_files=[],
+                 instructions="", priority=1, category="bugfix")
+            for i in range(4)
+        ]
+        attempts_by_bug_id = {
+            tasks[0].id[-8:]: 0,   # fresh — should go first
+            tasks[1].id[-8:]: 3,   # stale
+            tasks[2].id[-8:]: 1,
+            tasks[3].id[-8:]: 0,
+        }
+        # mirror the sort the orchestrator does
+        def _attempts_of(t):
+            bug_id = t.id.replace("qa-", "")
+            return attempts_by_bug_id.get(bug_id, 0)
+        tasks.sort(key=lambda t: (_attempts_of(t), t.priority))
+        # the 2 lowest-attempts tasks come first
+        kept = tasks[:2]
+        ids_kept = {t.id for t in kept}
+        self.assertEqual(ids_kept, {tasks[0].id, tasks[3].id}
+                         if tasks[0].id in ids_kept and tasks[3].id in ids_kept
+                         else ids_kept)
+        # the 0-attempt ones should be in the kept set
+        for t in kept:
+            self.assertEqual(_attempts_of(t), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

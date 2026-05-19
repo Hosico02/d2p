@@ -5,6 +5,8 @@ A failing test is the bug report. Tests must be:
 - inherits from unittest.TestCase
 - contains at least one def test_…
 - > 300 chars total (catches truncated LLM output)
+- parses as valid Python (ast.parse — catches markdown-fenced output and
+  other malformed dumps that would import-error in the corpus)
 - stdlib-only OR uses libs the project already imports
 
 The fix Task is dispatched with `forbidden_files=[test_path]` so the Executor
@@ -27,6 +29,7 @@ The QA agent has three responsibilities:
 """
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import os
@@ -598,11 +601,41 @@ def detect_missing_symbol_failures(text: str) -> list[tuple[str, str]]:
     return out
 
 
+_FENCE_OPEN_RE = re.compile(r"^\s*```[a-zA-Z0-9_+-]*\s*\n")
+_FENCE_CLOSE_RE = re.compile(r"\n\s*```\s*$")
+
+
+def _strip_md_fence(content: str) -> str:
+    """Remove a leading ```python (or any ```lang) and a trailing ``` if the
+    model wrapped the test file in a markdown code block. This is a common
+    LLM failure mode that silently bricks tests with SyntaxError.
+
+    Strip is conservative: only strip when BOTH ends look like fences, to
+    avoid mangling tests that legitimately contain a single ``` somewhere.
+    """
+    open_m = _FENCE_OPEN_RE.match(content)
+    close_m = _FENCE_CLOSE_RE.search(content)
+    if open_m and close_m:
+        return content[open_m.end():close_m.start()] + "\n"
+    return content
+
+
 def _validate_test_quality(content: str, language: str = "python") -> str:
     """Return non-empty reason if the test file is unfit to enter the corpus.
 
-    Per-language checks: Python wants `unittest.TestCase` + `def test_*`;
-    JS/TS want `node:test` import (or `test(`) and at least one assertion call.
+    Per-language checks: Python wants `unittest.TestCase` + `def test_*` +
+    valid `ast.parse()`; JS/TS want `node:test` import (or `test(`) and at
+    least one assertion call.
+
+    The ast.parse() check is critical — without it, a markdown-fenced test
+    file like:
+        ```python
+        import unittest
+        ...
+        ```
+    sails through the substring checks (it has "unittest.TestCase" and
+    "def test_") but explodes on import, polluting the corpus with a
+    SyntaxError that fix executors can't repair (test is forbidden).
     """
     if len(content) < 300:
         return f"too short ({len(content)} bytes — likely truncated)"
@@ -616,10 +649,20 @@ def _validate_test_quality(content: str, language: str = "python") -> str:
             return "no node:test usage"
         if "assert" not in content:
             return "no assertion calls"
-    # very crude truncation check — last non-empty line should look complete
+    # Crude truncation check FIRST — last non-empty line ending in an unclosed
+    # bracket / comma usually means the LLM ran out of tokens mid-line. We
+    # surface that explicitly because the diagnostic ("truncation") is more
+    # useful than the generic "SyntaxError at line N" ast.parse would report.
     last = content.rstrip().splitlines()[-1] if content.strip() else ""
     if last.endswith((",", "(", "[", "{", "+", "-", "=")):
         return f"trailing-syntax suggests truncation: {last[-40:]!r}"
+    # Real Python parse check — catches markdown-fenced test files, missing
+    # colons, mismatched parens, anything else that would fail at import.
+    if language == "python":
+        try:
+            ast.parse(content)
+        except SyntaxError as e:
+            return f"SyntaxError at line {e.lineno}: {e.msg}"
     return ""
 
 
@@ -646,6 +689,10 @@ def parse_qa_output(text: str) -> list[tuple[str, dict[str, Any], str]]:
         if body.startswith("\n"):
             body = body[1:]
         body = body.rstrip() + "\n"
+        # Strip ```python ... ``` fences the LLM sometimes wraps around the
+        # test body — they slip past the substring quality checks and only
+        # explode at import time inside the corpus.
+        body = _strip_md_fence(body)
         if path and body.strip():
             out.append((path, meta, body))
     return out

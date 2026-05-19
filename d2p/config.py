@@ -40,6 +40,13 @@ class Config:
     # stays in the corpus — if it ever turns green later, it gets flipped
     # back to "fixed" automatically.
     qa_wontfix_after_attempts: int = 3
+    # Cap how many QA-fix tasks run in a single iteration (0 = no cap).
+    # When the model+escalation cost per fix is high, this prevents one
+    # iter from blowing the budget on N parallel sonnet retries. Bugs
+    # left behind get picked up next iter — naturally favours bugs with
+    # the lowest attempts (i.e. freshest to try, not the ones already
+    # circling the drain).
+    max_concurrent_fixes: int = 0
 
     def require_key(self) -> None:
         if not self.api_key:

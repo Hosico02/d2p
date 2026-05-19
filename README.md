@@ -126,6 +126,7 @@ Flags:
 | `--no-qa` | off | skip the QA stage (faster, but no failing-test guardrails added) |
 | `--reanalyze-every N` | 0 | re-run Analyzer every N iters (essence/audience pinned); 0 disables |
 | `--qa-wontfix-after N` | 3 | retire a QA bug after N failed fix attempts; 0 disables |
+| `--max-concurrent-fixes N` | 0 | cap fix tasks per iter (0=no cap); lowest-attempt bugs go first |
 | `--no-cache-analysis` | off | force a fresh Analyzer call (ignore `.d2p/analysis_cache.json`) |
 | `-v` | off | verbose logs |
 

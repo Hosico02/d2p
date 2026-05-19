@@ -56,6 +56,43 @@ def _discover_pre_existing_tests(sandbox: Sandbox) -> list[str]:
     return out
 
 
+# Error-message substrings that indicate a *structural* failure (executor
+# couldn't even attempt the work — wrong task framing, forbidden target,
+# empty plan, etc.). For these, retrying with a stronger model wastes
+# tokens because the constraint isn't model-quality.
+_STRUCTURAL_FAILURE_MARKERS = (
+    "forbidden (test file",   # tried to write a QA-protected test
+    "forbidden (",            # any forbidden_files violation
+    "no target files",        # empty plan output
+    "no ===FILE===",          # parser found zero blocks
+    "no ===PATCH===",
+    "path escapes sandbox",   # tried to write outside sandbox
+)
+
+
+def _should_escalate(error: str) -> bool:
+    """Decide whether a task failure is worth retrying with the fallback
+    model. Structural failures (forbidden file, wrong framing, sandbox
+    escape) won't fix themselves with a stronger model — skip the retry.
+    Everything else (regression rolled back, SEARCH miss, post-check fail,
+    syntax error, LLM hiccup) is worth one more shot.
+    """
+    if not error:
+        return True
+    e = error.lower()
+    return not any(marker in e for marker in _STRUCTURAL_FAILURE_MARKERS)
+
+
+def _flatten(msg: str, max_len: int = 200) -> str:
+    """Single-line, length-capped form of an error string. Without flattening,
+    a multi-line Traceback inside the log line shreds grep + monitor output
+    because each line of the traceback starts a new log entry."""
+    if not msg:
+        return ""
+    s = msg.replace("\r", " ").replace("\n", " | ")
+    return s[:max_len]
+
+
 def _rollback_if_baseline_test_regressed(sandbox: Sandbox, qa,
                                          *, baseline: dict[str, bool],
                                          snapshot: dict[str, Any]) -> bool:
@@ -200,6 +237,26 @@ class Orchestrator:
                          len(qa_report.fixed_bugs),
                          len(qa_report.retired_bugs))
                 if fix_tasks:
+                    # Optional per-iter fix cap. Each fix can trigger an
+                    # escalation, which is the most expensive single call in
+                    # the system; without a cap one iter can dispatch 6 fixes
+                    # × $0.10/escalation = serious budget. Sort by attempts
+                    # asc so fresh bugs go first (most likely to actually
+                    # work); the rest naturally roll to the next iter.
+                    cap = self.cfg.max_concurrent_fixes
+                    if cap and len(fix_tasks) > cap:
+                        # bug.test_path → attempts from current meta
+                        meta = self.qa._load_meta()
+                        def _attempts_of(t):
+                            for b in (qa_report.new_bugs + qa_report.open_bugs):
+                                if t.id.endswith(b.id):
+                                    return int(meta.get(b.test_path, {})
+                                                   .get("attempts", 0) or 0)
+                            return 0
+                        fix_tasks.sort(key=lambda t: (_attempts_of(t), t.priority))
+                        log.info("Fix cap: keeping %d/%d fix tasks this iter "
+                                 "(by lowest attempts)", cap, len(fix_tasks))
+                        fix_tasks = fix_tasks[:cap]
                     # 1) snapshot the entire test-result baseline + all files
                     # the fix tasks might touch, BEFORE running fixes.
                     fix_target_files = sorted({
@@ -573,21 +630,29 @@ class Orchestrator:
             res, _snapshot = _attempt(task, executors[idx % max_workers], pc)
 
             # Escalation: if the primary executor failed AND a fallback model
-            # is wired for this role, retry once with the stronger model.
+            # is wired for this role AND the failure is the kind a stronger
+            # model could plausibly fix, retry once.
             # The sandbox is already rolled back to the pre-task state, so the
             # second attempt starts from the same baseline as the first.
             if res.status != "done" and fallback_llm is not None:
-                log.info("task %s failed (%s) — escalating to %s",
-                         task.id, (res.error or "")[:80], fallback_llm.name)
-                fb_executor = Executor(fallback_llm, self.sandbox)
-                fb_res, _ = _attempt(task, fb_executor, pc)
-                if fb_res.status == "done":
-                    fb_res.summary = (fb_res.summary or "") + " [escalated]"
-                    res = fb_res
+                if _should_escalate(res.error):
+                    log.info("task %s failed (%s) — escalating to %s",
+                             task.id, _flatten(res.error, 120),
+                             fallback_llm.name)
+                    fb_executor = Executor(fallback_llm, self.sandbox)
+                    fb_res, _ = _attempt(task, fb_executor, pc)
+                    if fb_res.status == "done":
+                        fb_res.summary = (fb_res.summary or "") + " [escalated]"
+                        res = fb_res
+                    else:
+                        # keep the original error too — debug visibility for users
+                        # who want to know which model failed which way
+                        res.error = ((res.error or "") +
+                                     " | escalation also failed: " +
+                                     _flatten(fb_res.error, 120))
                 else:
-                    # keep the original error too — debug visibility for users
-                    # who want to know which model failed which way
-                    res.error = (res.error or "") + f" | escalation also failed: {(fb_res.error or '')[:120]}"
+                    log.info("task %s failed structurally (%s) — skipping escalation",
+                             task.id, _flatten(res.error, 120))
 
             log.info("task %s [%s] -> %s (%d files)",
                      task.id, task.title[:60], res.status, len(res.files_changed))

@@ -20,6 +20,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--qa-wontfix-after", type=int, default=3,
                    help="retire QA bugs after this many failed fix attempts "
                         "(default 3, 0=never retire)")
+    p.add_argument("--max-concurrent-fixes", type=int, default=0,
+                   help="cap fix tasks per iter (0=no cap). Lowest-attempt "
+                        "bugs go first; the rest roll to next iter.")
     p.add_argument("--no-cache-analysis", action="store_true",
                    help="force a fresh Analyzer run, ignoring "
                         ".d2p/analysis_cache.json")
@@ -35,6 +38,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = Config()
     cfg.reanalyze_every = args.reanalyze_every
     cfg.qa_wontfix_after_attempts = args.qa_wontfix_after
+    cfg.max_concurrent_fixes = args.max_concurrent_fixes
     orch = Orchestrator(args.target, cfg=cfg, max_iterations=args.iter,
                         parallel=args.parallel, enable_qa=not args.no_qa,
                         use_analyzer_cache=not args.no_cache_analysis)
