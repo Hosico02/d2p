@@ -266,7 +266,7 @@ Return a JSON object:
   ]
 }}
 Constraints:
-- 3 to {max_tasks} tasks.
+- {min_tasks} to {max_tasks} tasks.
 - Every task instruction must restate which aspect of `essence` it preserves.
 - target_files must be paths inside the project. Use new paths for new files.
 - Mention specific existing symbols you want to extend (e.g. "extend GameMaster.vote_phase").
@@ -324,7 +324,13 @@ class Planner:
 
     def run(self, analysis: AnalysisReport, *, iteration: int, max_iter: int,
             history: list[dict[str, Any]],
-            open_bugs: list[dict[str, Any]] | None = None) -> PlanResult:
+            open_bugs: list[dict[str, Any]] | None = None,
+            feature_cap: int | None = None) -> PlanResult:
+        """Build the next plan. If `feature_cap` is set, the Planner is told
+        to emit at most that many tasks — avoids the previous "Planner
+        produces 5, orchestrator post-hoc trims to 1 under bug debt"
+        pattern that wasted 4× the reasoning budget."""
+        cap = feature_cap if feature_cap is not None else self.max_tasks
         listing_raw = self.sandbox.listing(max_entries=200)
         listing_str = "\n".join(listing_raw)
         # strip the trailing "... (truncated)" marker before symbol/file picking
@@ -332,6 +338,12 @@ class Planner:
         key_files = self._pick_key_files(listing)
         key_files_block = self._build_key_files_block(key_files)
         symbol_map = build_symbol_map(self.sandbox.read, listing)
+        # Floor on requested task count: keep at least 3 so the Planner has
+        # room to surface multiple angles; cap on the upper end so it
+        # doesn't go crazy. The lower bound also stops the prompt template
+        # from rendering "3 to 1 tasks" (nonsense) when bug debt forces
+        # cap=1.
+        plan_lo = min(3, cap)
         user = PLANNER_USER_TMPL.format(
             analysis=_json.dumps(analysis.to_dict(), ensure_ascii=False, indent=2),
             listing=listing_str,
@@ -341,11 +353,12 @@ class Planner:
             history=_json.dumps(history[-3:], ensure_ascii=False, indent=2) if history else "(none)",
             iteration=iteration,
             max_iter=max_iter,
-            max_tasks=self.max_tasks,
+            min_tasks=plan_lo,
+            max_tasks=cap,
         )
         data = self.llm.chat_json(PLANNER_SYS, user, temperature=0.3, max_tokens=6000)
         tasks = []
-        for t in data.get("tasks", [])[: self.max_tasks]:
+        for t in data.get("tasks", [])[:cap]:
             tasks.append(Task(
                 id=uuid.uuid4().hex[:8],
                 title=str(t.get("title", "")).strip() or "untitled",

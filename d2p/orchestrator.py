@@ -210,10 +210,12 @@ class Orchestrator:
                 analysis, iteration=it,
                 max_iter=self.cfg.max_iterations,
                 history=history, open_bugs=open_bugs,
+                feature_cap=feature_cap,
             )
             self._dump(f"plan_iter{it}.json", plan.to_dict())
             log.info("Planner produced %d tasks (cap=%d)", len(plan.tasks), feature_cap)
-            # P2: trim to cap, prioritising small/low-risk tasks first
+            # P2: defence in depth — Planner already targets <= feature_cap,
+            # but trim+resort here in case it overshot. Small/low-risk first.
             plan.tasks = sorted(plan.tasks,
                                 key=lambda t: (t.priority, len(t.target_files)))[:feature_cap]
             if not plan.tasks:
@@ -240,31 +242,51 @@ class Orchestrator:
                     # Optional per-iter fix cap. Each fix can trigger an
                     # escalation, which is the most expensive single call in
                     # the system; without a cap one iter can dispatch 6 fixes
-                    # × $0.10/escalation = serious budget. Sort by attempts
-                    # asc so fresh bugs go first (most likely to actually
-                    # work); the rest naturally roll to the next iter.
+                    # × $0.10/escalation = serious budget. Cap qa-* tasks
+                    # only — restore-symbol tasks (id="restore-*") are cheap
+                    # mechanical edits that other tests depend on, so they
+                    # always run.
                     cap = self.cfg.max_concurrent_fixes
-                    if cap and len(fix_tasks) > cap:
-                        # bug.test_path → attempts from current meta
-                        meta = self.qa._load_meta()
-                        def _attempts_of(t):
-                            for b in (qa_report.new_bugs + qa_report.open_bugs):
-                                if t.id.endswith(b.id):
-                                    return int(meta.get(b.test_path, {})
-                                                   .get("attempts", 0) or 0)
-                            return 0
-                        fix_tasks.sort(key=lambda t: (_attempts_of(t), t.priority))
-                        log.info("Fix cap: keeping %d/%d fix tasks this iter "
-                                 "(by lowest attempts)", cap, len(fix_tasks))
-                        fix_tasks = fix_tasks[:cap]
+                    if cap:
+                        restore_tasks = [t for t in fix_tasks
+                                         if t.id.startswith("restore-")]
+                        bug_fix_tasks = [t for t in fix_tasks
+                                         if t.id.startswith("qa-")]
+                        if len(bug_fix_tasks) > cap:
+                            meta = self.qa._load_meta()
+                            def _attempts_of(t):
+                                # O(1) lookup via the test_path embedded in
+                                # the task's forbidden_files (set by
+                                # QAAgent._bug_to_task). No string endswith
+                                # heuristics, no O(N×M) scan.
+                                if not t.forbidden_files:
+                                    return 0
+                                return int(meta.get(t.forbidden_files[0], {})
+                                               .get("attempts", 0) or 0)
+                            bug_fix_tasks.sort(
+                                key=lambda t: (_attempts_of(t), t.priority))
+                            log.info("Fix cap: keeping %d/%d bug-fix tasks "
+                                     "this iter (by lowest attempts; %d "
+                                     "restore tasks exempt)",
+                                     cap, len(bug_fix_tasks), len(restore_tasks))
+                            bug_fix_tasks = bug_fix_tasks[:cap]
+                        fix_tasks = restore_tasks + bug_fix_tasks
                     # 1) snapshot the entire test-result baseline + all files
                     # the fix tasks might touch, BEFORE running fixes.
                     fix_target_files = sorted({
                         f for t in fix_tasks for f in t.target_files
                     })
                     pre_snapshot = self.sandbox.snapshot(fix_target_files)
-                    pre_pass_tests = self._test_baseline()
-                    log.info("Regression baseline: %d tests currently passing",
+                    # Reuse the corpus test outcomes QA just produced —
+                    # qa_report.test_runs is the same data _test_baseline()
+                    # would re-compute, but free (we already paid for those
+                    # subprocess runs during the QA sweep).
+                    pre_pass_tests = {
+                        p: (outcome.get("status") == "passed")
+                        for p, outcome in (qa_report.test_runs or {}).items()
+                    }
+                    log.info("Regression baseline: %d tests currently passing "
+                             "(reused from QA sweep)",
                              sum(1 for v in pre_pass_tests.values() if v))
 
                     # 2) per-task snapshot so we can selectively rollback

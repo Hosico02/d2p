@@ -362,6 +362,9 @@ class TestFlipMetaStatus(unittest.TestCase):
             qa = QAAgent.__new__(QAAgent)
             qa.sandbox = sb
             qa.corpus_dir = "tests/d2p_qa"
+            import threading as _th
+            qa._meta_lock = _th.Lock()
+            qa._test_run_lock = _th.Lock()
             qa.flip_meta_status("tests/d2p_qa/test_x.py", "fixed")
             meta = json.loads((root / "tests/d2p_qa/_meta.json").read_text())
             self.assertEqual(meta["tests/d2p_qa/test_x.py"]["status"], "fixed")
@@ -378,6 +381,9 @@ class TestFlipMetaStatus(unittest.TestCase):
             qa = QAAgent.__new__(QAAgent)
             qa.sandbox = sb
             qa.corpus_dir = "tests/d2p_qa"
+            import threading as _th
+            qa._meta_lock = _th.Lock()
+            qa._test_run_lock = _th.Lock()
             qa.flip_meta_status("not/in/meta.py", "fixed")  # noop
             meta = json.loads((root / "tests/d2p_qa/_meta.json").read_text())
             self.assertEqual(meta, {})
@@ -620,12 +626,15 @@ class TestUsageAccumulator(unittest.TestCase):
 
 class TestQAWontfix(unittest.TestCase):
     def _make_qa(self, root: Path) -> "object":
+        import threading as _th
         from d2p.qa import QAAgent
         (root / "tests" / "d2p_qa").mkdir(parents=True, exist_ok=True)
         sb = Sandbox(root)
         qa = QAAgent.__new__(QAAgent)
         qa.sandbox = sb
         qa.corpus_dir = "tests/d2p_qa"
+        qa._meta_lock = _th.Lock()
+        qa._test_run_lock = _th.Lock()
         return qa
 
     def test_bump_attempts_increments(self) -> None:
@@ -1137,6 +1146,121 @@ class TestBumpAttemptsScope(unittest.TestCase):
             if t.id.startswith("qa-") and t.forbidden_files
         }
         self.assertEqual(set(bug_test_paths.keys()), {"qa-yyyy"})
+
+
+class TestMetaConcurrency(unittest.TestCase):
+    """Regression test for the 2026-05-19 race: parallel post_check callbacks
+    invoked flip_meta_status concurrently for different bugs; the
+    read-modify-write of _meta.json lost updates because there was no lock.
+    Now _meta_lock serialises all meta mutations."""
+
+    def test_parallel_flips_all_persist(self) -> None:
+        import threading as _th
+        from d2p.qa import QAAgent
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "tests" / "d2p_qa").mkdir(parents=True)
+            # 20 distinct bugs, all open
+            initial = {
+                f"tests/d2p_qa/test_{i}.py": {
+                    "id": f"b{i}", "title": f"t{i}",
+                    "test_path": f"tests/d2p_qa/test_{i}.py",
+                    "category": "x", "summary": "",
+                    "suspected_files": [], "last_failure": "",
+                    "status": "open", "attempts": 0,
+                }
+                for i in range(20)
+            }
+            (root / "tests" / "d2p_qa" / "_meta.json").write_text(
+                json.dumps(initial))
+            sb = Sandbox(root)
+            qa = QAAgent.__new__(QAAgent)
+            qa.sandbox = sb
+            qa.corpus_dir = "tests/d2p_qa"
+            qa._meta_lock = _th.Lock()
+            qa._test_run_lock = _th.Lock()
+
+            def flip(i):
+                qa.flip_meta_status(f"tests/d2p_qa/test_{i}.py", "fixed")
+
+            threads = [_th.Thread(target=flip, args=(i,)) for i in range(20)]
+            for t in threads: t.start()
+            for t in threads: t.join()
+
+            final = json.loads((root / "tests/d2p_qa/_meta.json").read_text())
+            # Every bug must show status=fixed. Without the lock, the
+            # last-writer-wins race drops updates and most stay "open".
+            for i in range(20):
+                self.assertEqual(
+                    final[f"tests/d2p_qa/test_{i}.py"]["status"], "fixed",
+                    f"bug {i} lost its flip — meta race regression",
+                )
+
+    def test_parallel_bumps_all_count(self) -> None:
+        import threading as _th
+        from d2p.qa import QAAgent
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "tests" / "d2p_qa").mkdir(parents=True)
+            initial = {
+                "tests/d2p_qa/test_x.py": {
+                    "id": "a", "title": "t",
+                    "test_path": "tests/d2p_qa/test_x.py",
+                    "category": "x", "summary": "", "suspected_files": [],
+                    "last_failure": "", "status": "open", "attempts": 0,
+                },
+            }
+            (root / "tests" / "d2p_qa" / "_meta.json").write_text(
+                json.dumps(initial))
+            sb = Sandbox(root)
+            qa = QAAgent.__new__(QAAgent)
+            qa.sandbox = sb
+            qa.corpus_dir = "tests/d2p_qa"
+            qa._meta_lock = _th.Lock()
+            qa._test_run_lock = _th.Lock()
+
+            N = 50
+            threads = [_th.Thread(
+                target=qa.bump_attempts,
+                args=("tests/d2p_qa/test_x.py",),
+            ) for _ in range(N)]
+            for t in threads: t.start()
+            for t in threads: t.join()
+
+            final = json.loads((root / "tests/d2p_qa/_meta.json").read_text())
+            # Without the lock, lost updates would make attempts < N.
+            self.assertEqual(
+                final["tests/d2p_qa/test_x.py"]["attempts"], N,
+                "attempts lost updates — meta race regression",
+            )
+
+
+class TestPlannerFeatureCap(unittest.TestCase):
+    def test_planner_renders_min_max_from_feature_cap(self) -> None:
+        from unittest.mock import MagicMock
+        from d2p.agents import Planner, ANALYZER_USER_TMPL  # noqa: F401
+        from d2p.models import AnalysisReport
+        # Build a Planner with a mocked llm and capture the user prompt
+        sb_mock = MagicMock()
+        sb_mock.listing.return_value = ["app.py"]
+        sb_mock.read.return_value = "print(1)\n"
+        llm_mock = MagicMock()
+        llm_mock.chat_json.return_value = {"rationale": "", "tasks": []}
+        p = Planner(llm_mock, sb_mock, max_tasks=5)
+        p.run(
+            AnalysisReport(domain="x", essence="e", audience="a"),
+            iteration=1, max_iter=2,
+            history=[], open_bugs=None,
+            feature_cap=1,
+        )
+        # Last positional arg to chat_json is the user prompt
+        _, kwargs = llm_mock.chat_json.call_args
+        # chat_json(system, user, **kw) — user is args[1]
+        args = llm_mock.chat_json.call_args.args
+        user_prompt = args[1] if len(args) > 1 else kwargs.get("user", "")
+        # When feature_cap=1, both min_tasks and max_tasks collapse to 1
+        # (the floor formula uses min(3, cap)).
+        self.assertIn("1 to 1 tasks", user_prompt)
 
 
 if __name__ == "__main__":

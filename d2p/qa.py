@@ -37,6 +37,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -203,6 +204,15 @@ class QAAgent:
         # adapters override it per-language (e.g. JS uses the same dir).
         self.corpus_dir = self.adapter.test_corpus_dir
         self._test_python = self._pick_test_python()
+        # Concurrency guards:
+        # _meta_lock — serialises read-modify-write on _meta.json. Without
+        #   it, parallel post_check callbacks (flip_meta_status) lose updates.
+        # _test_run_lock — serialises test subprocess execution. Tests share
+        #   the demo's cwd (sandbox root), so two concurrent fix-task
+        #   post_checks can collide on shared on-disk state like sqlite
+        #   files. Cheap enough to just serialise.
+        self._meta_lock = threading.Lock()
+        self._test_run_lock = threading.Lock()
         log.info("QA language=%s corpus=%s runner-python=%s",
                  self.adapter.name, self.corpus_dir, self._test_python)
 
@@ -422,57 +432,72 @@ class QAAgent:
 
     def _save_meta(self, failing: list[BugReport],
                    fixed: list[BugReport]) -> None:
-        prior = self._load_meta()
-        for b in failing:
-            # Preserve the bug's tracked status (open vs wontfix) instead of
-            # blindly overwriting to "open" — otherwise a retired bug would
-            # reset to "open" on every QA sweep.
-            prior[b.test_path] = {**b.to_dict()}
-        for b in fixed:
-            prior[b.test_path] = {**b.to_dict(), "status": "fixed"}
-        self.sandbox.write(f"{self.corpus_dir}/_meta.json",
-                           json.dumps(prior, ensure_ascii=False, indent=2))
+        with self._meta_lock:
+            prior = self._load_meta()
+            for b in failing:
+                # Preserve the bug's tracked status (open vs wontfix) instead of
+                # blindly overwriting to "open" — otherwise a retired bug would
+                # reset to "open" on every QA sweep.
+                prior[b.test_path] = {**b.to_dict()}
+            for b in fixed:
+                prior[b.test_path] = {**b.to_dict(), "status": "fixed"}
+            self.sandbox.write(f"{self.corpus_dir}/_meta.json",
+                               json.dumps(prior, ensure_ascii=False, indent=2))
 
     def flip_meta_status(self, test_path: str, status: str) -> None:
         """Atomically flip a single bug's status in _meta.json. Called by the
         orchestrator the instant a fix's post_check turns green, so 'fixed'
-        statistics reflect reality this iteration — not the next."""
-        prior = self._load_meta()
-        if test_path not in prior:
-            return
-        prior[test_path]["status"] = status
-        self.sandbox.write(f"{self.corpus_dir}/_meta.json",
-                           json.dumps(prior, ensure_ascii=False, indent=2))
+        statistics reflect reality this iteration — not the next.
+
+        Thread-safe: this is called inside parallel `_check` callbacks; the
+        meta lock prevents lost updates between concurrent flips for
+        different bugs."""
+        with self._meta_lock:
+            prior = self._load_meta()
+            if test_path not in prior:
+                return
+            prior[test_path]["status"] = status
+            self.sandbox.write(f"{self.corpus_dir}/_meta.json",
+                               json.dumps(prior, ensure_ascii=False, indent=2))
 
     def bump_attempts(self, test_path: str) -> int:
         """Increment the attempt counter for a still-failing bug after a fix
         round. Returns the new attempt count. Used by orchestrator to decide
         whether to retire the bug (mark wontfix)."""
-        prior = self._load_meta()
-        if test_path not in prior:
-            return 0
-        n = int(prior[test_path].get("attempts", 0) or 0) + 1
-        prior[test_path]["attempts"] = n
-        self.sandbox.write(f"{self.corpus_dir}/_meta.json",
-                           json.dumps(prior, ensure_ascii=False, indent=2))
-        return n
+        with self._meta_lock:
+            prior = self._load_meta()
+            if test_path not in prior:
+                return 0
+            n = int(prior[test_path].get("attempts", 0) or 0) + 1
+            prior[test_path]["attempts"] = n
+            self.sandbox.write(f"{self.corpus_dir}/_meta.json",
+                               json.dumps(prior, ensure_ascii=False, indent=2))
+            return n
 
     def mark_wontfix(self, test_path: str) -> None:
         """Retire a bug: keep the test in the corpus (so future runs notice
         if it goes green) but stop dispatching fix tasks for it."""
-        prior = self._load_meta()
-        if test_path not in prior:
-            return
-        prior[test_path]["status"] = "wontfix"
-        self.sandbox.write(f"{self.corpus_dir}/_meta.json",
-                           json.dumps(prior, ensure_ascii=False, indent=2))
-        log.info("QA retired bug %s as wontfix (attempts=%s)",
-                 test_path, prior[test_path].get("attempts", "?"))
+        with self._meta_lock:
+            prior = self._load_meta()
+            if test_path not in prior:
+                return
+            prior[test_path]["status"] = "wontfix"
+            self.sandbox.write(f"{self.corpus_dir}/_meta.json",
+                               json.dumps(prior, ensure_ascii=False, indent=2))
+            log.info("QA retired bug %s as wontfix (attempts=%s)",
+                     test_path, prior[test_path].get("attempts", "?"))
 
     def _run_test_file(self, rel_path: str) -> dict[str, Any]:
         """Run one test file via the adapter's runner. Python falls back to
         unittest with the picked interpreter; JS uses `node --test`; unknown
-        languages return a no-op 'unsupported' verdict."""
+        languages return a no-op 'unsupported' verdict.
+
+        Thread-safety: all test subprocesses share the demo's sandbox root
+        as cwd; two concurrent test runs can collide on shared on-disk
+        state (e.g. sqlite files like todos.db, lock files, temp dirs).
+        Serialising through `_test_run_lock` avoids that. The cost is small
+        because individual tests are sub-second and fix tasks rarely run
+        more than a handful of post_checks per iter."""
         cmd = self.adapter.test_runner_cmd(rel_path, sandbox=self.sandbox)
         if not cmd:
             # Python adapter overrides may be inactive (e.g. NullAdapter);
@@ -488,19 +513,20 @@ class QAAgent:
             # picked interpreter (which has the project's deps installed).
             cmd = [self._test_python] + cmd[1:]
         env = {**os.environ}
-        try:
-            r = subprocess.run(
-                cmd, cwd=str(self.sandbox.root),
-                capture_output=True, text=True, timeout=30, env=env,
-            )
-            output = (r.stdout + "\n" + r.stderr).strip()
-            status = "passed" if r.returncode == 0 else "failed"
-            return {"status": status, "returncode": r.returncode, "output": output}
-        except subprocess.TimeoutExpired as e:
-            return {"status": "timeout", "returncode": -1,
-                    "output": f"timeout after 30s\n{e.stdout or ''}\n{e.stderr or ''}"}
-        except Exception as e:
-            return {"status": "error", "returncode": -1, "output": str(e)}
+        with self._test_run_lock:
+            try:
+                r = subprocess.run(
+                    cmd, cwd=str(self.sandbox.root),
+                    capture_output=True, text=True, timeout=30, env=env,
+                )
+                output = (r.stdout + "\n" + r.stderr).strip()
+                status = "passed" if r.returncode == 0 else "failed"
+                return {"status": status, "returncode": r.returncode, "output": output}
+            except subprocess.TimeoutExpired as e:
+                return {"status": "timeout", "returncode": -1,
+                        "output": f"timeout after 30s\n{e.stdout or ''}\n{e.stderr or ''}"}
+            except Exception as e:
+                return {"status": "error", "returncode": -1, "output": str(e)}
 
     def _probe_for_new_bugs(self, *, analysis_summary: str,
                             essence: str, audience: str,
