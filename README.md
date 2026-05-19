@@ -166,11 +166,26 @@ skim-friendly view of what actually moved that round:
 - the Planner's rationale
 - feature tasks (done/failed) with files touched
 - QA fixes (done/failed) with the test path each one targeted
-- bugs: new vs fixed vs still-open vs retired
+- bug lifecycle counters (see below)
 - a "Files touched" rollup
 - the cumulative LLM-usage line (calls, cost, cache hit ratio)
 
-That last line means you don't have to spelunk JSON to know what a run cost.
+The Bugs section labels each count by its place in the lifecycle so the
+numbers are interpretable in isolation:
+
+```
+## Bugs
+- carried in (open from prior iters): 2
+- new this iter: 4
+- incidentally fixed (passed before fix sweep): 1
+- fix tasks: 3 ok, 0 failed
+- retired (wontfix) this iter: 0
+- **still open going forward: 3**
+```
+
+That last line is the number that gets carried into the next iter. The
+final line of the iter md is the cumulative cost — you don't have to
+spelunk JSON to know what a run cost.
 
 ---
 
@@ -178,17 +193,41 @@ That last line means you don't have to spelunk JSON to know what a run cost.
 
 | File | Lines | Role |
 |---|---:|---|
-| `run.py` | 40 | CLI entry |
-| `d2p/orchestrator.py` | ~570 | Closed-loop driver, sandbox, rollback, parallelism, iter digests |
-| `d2p/agents.py` | 875 | Analyzer / Planner / Executor LLM agents |
-| `d2p/qa.py` | ~640 | QA agent (probe → failing test → fix dispatch, retirement) |
-| `d2p/providers/` | ~750 | minimax / claude / claude-cli / codex backends, role router, usage ledger |
-| `d2p/lang/` | ~250 | Language adapters (Python + JS health probes, 3.10+ picker) |
+| `run.py` | 50 | CLI entry |
+| `d2p/orchestrator.py` | ~730 | Closed-loop driver, sandbox, rollback, parallelism, iter digests, escalation |
+| `d2p/agents.py` | ~960 | Analyzer (cache+fingerprint) / Planner (cap-aware) / Executor LLM agents |
+| `d2p/qa.py` | ~720 | QA agent (probe → failing test → fix dispatch, retirement, meta locks) |
+| `d2p/providers/` | ~750 | minimax / claude / claude-cli / codex backends, role router, usage ledger, fallback wiring |
+| `d2p/lang/` | ~470 | Language adapters (Python + JS health probes, 3.10+ picker) |
 | `d2p/fs.py` | 91 | Sandbox file ops + snapshot/restore |
 | `d2p/health.py` | 25 | Module-level import probe |
 | `d2p/symbols.py` | 60 | Symbol map for the analyzer's project view |
 | `d2p/models.py` | 78 | Dataclasses for Task / Feature / ExecutionResult etc. |
-| **Total core** | **~2.8k LOC** | |
+| **Total core** | **~4k LOC** | |
+
+### Correctness invariants
+
+- **Sandbox**: every write resolves under the target root; `..` paths raise.
+- **Per-task snapshot/restore**: snapshot taken under a per-file lock right
+  before the executor writes; rolled back if the post-task probe regresses.
+- **Health probe**: module-level `import X` for every top-level `.py` and
+  every `tests/*.py`. Catches symbol-deletion regressions that
+  syntax-checking misses.
+- **Baseline test gate**: demo-author tests that were passing must still
+  pass after each task, else rollback.
+- **QA test corpus regression sweep**: after each fix round, every corpus
+  test is re-run; any previously-green test that regressed triggers a
+  conservative rollback of ALL fixes in that round.
+- **Meta-file locking**: `_meta.json` mutations (`flip_meta_status`,
+  `bump_attempts`, `mark_wontfix`, `_save_meta`) take a single lock —
+  required because `flip_meta_status` is invoked from parallel post_check
+  callbacks. Without it the read-modify-write loses updates.
+- **Test execution serialised**: all corpus test subprocesses share the
+  demo's cwd; concurrent runs would collide on shared on-disk state
+  (sqlite files, lock files). A second lock serialises the subprocess
+  window only — orchestrator parallelism is preserved elsewhere.
+- **Forbidden files**: fix tasks include the bug-test path in
+  `forbidden_files`; the executor refuses writes to it.
 
 For comparison: the older sibling project [MatrixOmnix](https://github.com/) (`demo2project`) hard-codes
 60+ gap detectors + per-detector planner cases + per-task executor handlers,
@@ -232,8 +271,9 @@ reserved for Analyzer / Planner / QA where reasoning quality dominates.
 ### Auto-escalation on task failure
 
 Any role can have a fallback model wired via env. When the primary
-provider fails a task (regression rollback, syntax fail, SEARCH miss),
-the orchestrator retries once with the fallback before giving up:
+provider fails a task with a *retryable* error (regression rollback,
+syntax fail, SEARCH miss, post-check failure), the orchestrator retries
+once with the fallback before giving up:
 
 ```bash
 # Primary haiku, escalate to sonnet only when haiku fails:
@@ -243,8 +283,21 @@ D2P_ROLE_FIX_FALLBACK_MODEL=sonnet \
 python run.py <demo> --iter 2
 ```
 
+Structural failures (forbidden test-file edits, sandbox escapes, empty
+plan output) are NOT escalated — a stronger model would hit the same
+wall. Saves the sonnet/opus tokens for cases where they can plausibly
+help.
+
 Fallback usage is tagged as `<role>-fallback` in `summary.json`, so the
-cost of escalations is separately visible from the cheap-model baseline.
+cost of escalations is separately visible from the cheap-model baseline:
+
+```
+"per_role": {
+  "fix:haiku":           { "calls": 5, "cost_usd": 0.20 },
+  "fix-fallback:sonnet": { "calls": 1, "cost_usd": 0.14 },
+  ...
+}
+```
 
 ### Cost & cache visibility
 
