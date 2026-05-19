@@ -1,0 +1,81 @@
+"""Anthropic Claude provider.
+
+Uses the official Anthropic API directly. By default the orchestrator wires:
+  - Haiku (cheap+fast)  → executor / fix / self_heal
+  - Opus (smart+deep)   → analyzer / planner / qa
+"""
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any
+
+import anthropic
+
+from ._json import extract_json
+
+log = logging.getLogger("d2p.providers.claude")
+
+
+WEB_SEARCH_TOOL = {
+    "type": "web_search_20250305",
+    "name": "web_search",
+    "max_uses": 5,
+}
+
+
+class ClaudeProvider:
+    def __init__(self, *, api_key: str, model: str,
+                 base_url: str | None = None,
+                 timeout: int = 240, role: str = "default") -> None:
+        if not api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY is empty")
+        self.role = role
+        self.model = model
+        self.name = f"claude:{model}@{role}"
+        kwargs = {"api_key": api_key, "timeout": timeout}
+        if base_url:
+            kwargs["base_url"] = base_url
+        self._client = anthropic.Anthropic(**kwargs)
+
+    def chat(self, system: str, user: str, *,
+             web_search: bool = False, json_mode: bool = False,
+             temperature: float = 0.4, max_tokens: int = 4096) -> str:
+        if json_mode:
+            user += "\n\nReturn ONLY a single JSON object/array. No prose, no markdown fences."
+        kwargs: dict[str, Any] = {
+            "model": self.model, "system": system,
+            "messages": [{"role": "user", "content": user}],
+            "max_tokens": max_tokens, "temperature": temperature,
+        }
+        if web_search:
+            kwargs["tools"] = [WEB_SEARCH_TOOL]
+        resp = self._client.messages.create(**kwargs)
+        parts = []
+        for block in resp.content or []:
+            if getattr(block, "type", None) == "text":
+                parts.append(block.text)
+        return "".join(parts).strip()
+
+    def chat_json(self, system: str, user: str, *,
+                  web_search: bool = False, temperature: float = 0.3,
+                  max_tokens: int = 4096, retries: int = 2) -> Any:
+        last_raw = ""
+        last_err: Exception | None = None
+        for attempt in range(retries + 1):
+            raw = self.chat(system, user, web_search=web_search, json_mode=True,
+                            temperature=temperature + 0.1 * attempt,
+                            max_tokens=max_tokens)
+            last_raw = raw
+            try:
+                return extract_json(raw)
+            except (ValueError, json.JSONDecodeError) as e:
+                last_err = e
+                log.warning("chat_json parse fail %d/%d: %s | head=%r",
+                            attempt + 1, retries + 1, e, raw[:200])
+                user += ("\n\nIMPORTANT: previous reply was not valid JSON. "
+                         "Return ONLY a single JSON object/array, no prose.")
+        raise RuntimeError(
+            f"chat_json failed after {retries + 1} attempts: {last_err}; "
+            f"last raw head: {last_raw[:300]!r}"
+        )

@@ -1,0 +1,28 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets
+.env
+.env.local
+
+# d2p artifacts written into target projects (also under this repo when tested)
+.d2p/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Editor / agent state
+.claude/
+
+# Big local artifacts (not for upstream)
+*.zip
+稳定版*.zip

@@ -1,0 +1,108 @@
+{
+  "_description": "Generic bug-class checklist used by the QA agent on every project. Curated from common production failure modes — extend over time. The QA agent uses these as a framing prompt; concrete tests are still generated per-project.",
+  "categories": [
+    {
+      "id": "input_validation",
+      "name": "Missing / malformed input handling",
+      "probes": [
+        "Endpoint called with empty body",
+        "Endpoint called with wrong Content-Type",
+        "Required field missing",
+        "Field is null instead of expected type",
+        "Field exceeds reasonable size (e.g. 10MB string)",
+        "Unicode / emoji in fields that look ASCII-only",
+        "Negative / zero / very large numeric values"
+      ]
+    },
+    {
+      "id": "auth_authz",
+      "name": "Authentication & authorization gaps",
+      "probes": [
+        "Endpoint that should require auth accepts unauthenticated requests",
+        "User A can read/modify user B's resource by guessing the ID",
+        "Tokens not validated for expiry/signature",
+        "Role checks missing on admin-only paths"
+      ]
+    },
+    {
+      "id": "concurrency",
+      "name": "Concurrency / race conditions",
+      "probes": [
+        "Shared mutable state accessed without a lock",
+        "Two requests for the same resource succeed when only one should",
+        "Background thread modifies dict iterated by handler",
+        "TTL cleanup races with read"
+      ]
+    },
+    {
+      "id": "resource_lifecycle",
+      "name": "Resource leaks & cleanup",
+      "probes": [
+        "Files / sockets opened but not closed on error",
+        "Long-lived objects accumulate in a dict with no eviction",
+        "Subprocesses spawned without wait()",
+        "DB connections not returned to pool on exception"
+      ]
+    },
+    {
+      "id": "error_propagation",
+      "name": "Errors swallowed or leaked",
+      "probes": [
+        "Bare `except:` that hides bugs",
+        "Server returns 500 with stacktrace instead of structured error",
+        "Frontend keeps spinning when backend fails",
+        "Partial failures leave inconsistent state"
+      ]
+    },
+    {
+      "id": "state_machine",
+      "name": "Domain state-machine violations",
+      "probes": [
+        "Action triggered in a phase that should disallow it",
+        "Same action triggered twice produces two effects",
+        "Game/workflow can be 'finished' but still accept inputs",
+        "Skipping a required step leaves a half-initialized object"
+      ]
+    },
+    {
+      "id": "api_contract",
+      "name": "API contract drift",
+      "probes": [
+        "Response missing documented field",
+        "Status code is 200 even on logical failure",
+        "JSON field types inconsistent across endpoints",
+        "Pagination cursor invalidated by concurrent writes"
+      ]
+    },
+    {
+      "id": "i18n_and_text",
+      "name": "Text / encoding / i18n",
+      "probes": [
+        "UTF-8 round-trip breaks (mojibake)",
+        "Locale-specific number/date formatting hard-coded",
+        "RTL languages render mirrored",
+        "Length truncation cuts a multi-byte char in half"
+      ]
+    },
+    {
+      "id": "deployment",
+      "name": "Deployment / packaging readiness",
+      "probes": [
+        "requirements.txt / package.json missing a dep that is imported",
+        "Hardcoded localhost URLs or 127.0.0.1",
+        "Secrets/keys committed to source",
+        "App fails on Python 3.9 / Node 16 / etc. minimum stated version"
+      ]
+    },
+    {
+      "id": "observability",
+      "name": "Observability gaps",
+      "probes": [
+        "No logging on critical failure paths",
+        "Logs leak PII or secrets",
+        "Metrics missing for slow operations",
+        "No request_id correlation across services"
+      ]
+    }
+  ]
+}
