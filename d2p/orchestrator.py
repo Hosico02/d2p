@@ -407,6 +407,7 @@ class Orchestrator:
                 it, plan=plan, results=results, qa_report=qa_report,
                 qa_fix_results=qa_fix_results,
                 retired_this_iter=retired_this_iter,
+                still_open_count=len(open_bugs),
                 elapsed_s=iter_elapsed_s,
                 cost_delta_usd=iter_cost_delta,
             )
@@ -459,6 +460,7 @@ class Orchestrator:
                               plan, results: list[ExecutionResult],
                               qa_report, qa_fix_results: list[ExecutionResult],
                               retired_this_iter: list[str],
+                              still_open_count: int = 0,
                               elapsed_s: float = 0.0,
                               cost_delta_usd: float = 0.0) -> None:
         """Write iter{N}_changes.md — a human-readable digest of what moved
@@ -508,15 +510,32 @@ class Orchestrator:
                 lines.append("- (no fix tasks dispatched)")
             lines.append("")
 
-            # Bug summary
+            # Bug flow summary. Each label here means exactly one thing —
+            # earlier versions of this section conflated "open at QA entry"
+            # with "open after fix sweep", giving counts that didn't match
+            # reality. Now the labels make the lifecycle explicit:
+            #   carried in   = bugs failing entering this iter (from prior runs)
+            #   new          = bugs first discovered this iter
+            #   incidentally fixed = bugs that turned green via feature work,
+            #                  i.e. the QA regression sweep found them passing
+            #                  before any fix task ran for them
+            #   fix tasks    = qa-* tasks dispatched this iter (capped+escalated)
+            #   retired      = bugs flipped to wontfix this iter
+            #   still open going forward = the count carried into next iter
+            fix_done = sum(1 for r in qa_fix_results if r.status == "done")
+            fix_failed = sum(1 for r in qa_fix_results if r.status != "done")
             lines.append("## Bugs")
+            lines.append(f"- carried in (open from prior iters): "
+                         f"{len(qa_report.open_bugs)}")
             lines.append(f"- new this iter: {len(qa_report.new_bugs)}")
-            lines.append(f"- fixed this iter: {len(qa_report.fixed_bugs)}")
-            lines.append(f"- still open: {len(qa_report.open_bugs)}")
+            lines.append(f"- incidentally fixed (passed before fix sweep): "
+                         f"{len(qa_report.fixed_bugs)}")
+            lines.append(f"- fix tasks: {fix_done} ok, {fix_failed} failed")
             lines.append(f"- retired (wontfix) this iter: {len(retired_this_iter)}")
             if retired_this_iter:
                 for tp in retired_this_iter:
                     lines.append(f"    - {tp}")
+            lines.append(f"- **still open going forward: {still_open_count}**")
             lines.append("")
             if qa_report.new_bugs:
                 lines.append("### New bugs")

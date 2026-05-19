@@ -1235,6 +1235,85 @@ class TestMetaConcurrency(unittest.TestCase):
             )
 
 
+class TestIterMdBugCounts(unittest.TestCase):
+    """The Bugs section of iter md must reflect the actual lifecycle, not
+    confuse "carried in from prior iters" with "still open after fix sweep".
+    Regression for the 2026-05-19 audit finding."""
+
+    def test_bug_section_labels(self) -> None:
+        from unittest.mock import MagicMock
+        from d2p.orchestrator import Orchestrator
+        from d2p.models import PlanResult
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            orch = Orchestrator.__new__(Orchestrator)
+            orch.run_dir = root
+            orch.router = MagicMock()
+            orch.router.usage.summary.return_value = {
+                "total_calls": 0, "total_cost_usd": 0.0,
+                "cache_hit_ratio": 0.0, "per_role": {},
+                "total_input_tokens": 0, "total_output_tokens": 0,
+                "total_cache_creation_tokens": 0, "total_cache_read_tokens": 0,
+            }
+            plan = PlanResult(iteration=1, tasks=[], rationale="r")
+            # Simulate: 2 carried in, 4 new, 1 incidentally fixed, 2 retired,
+            # 3 still open going forward.
+            fake_qa = MagicMock()
+            fake_qa.new_bugs = [MagicMock(test_path=f"t{i}", title=f"t{i}")
+                                for i in range(4)]
+            fake_qa.fixed_bugs = [MagicMock(test_path="f1", title="f1")]
+            fake_qa.open_bugs = [MagicMock(test_path="o1", title="o1"),
+                                 MagicMock(test_path="o2", title="o2")]
+            orch._emit_iter_changes_md(
+                1, plan=plan, results=[], qa_report=fake_qa,
+                qa_fix_results=[],
+                retired_this_iter=["r1.py", "r2.py"],
+                still_open_count=3,
+                elapsed_s=1.0, cost_delta_usd=0.0,
+            )
+            md = (root / "iter1_changes.md").read_text()
+            # New, unambiguous labels
+            self.assertIn("carried in (open from prior iters): 2", md)
+            self.assertIn("new this iter: 4", md)
+            self.assertIn("incidentally fixed", md)
+            self.assertIn("retired (wontfix) this iter: 2", md)
+            self.assertIn("still open going forward: 3", md)
+            # Old ambiguous label must NOT appear
+            self.assertNotIn("- still open: 2", md)
+
+    def test_fix_task_ok_failed_counts(self) -> None:
+        from unittest.mock import MagicMock
+        from d2p.orchestrator import Orchestrator
+        from d2p.models import ExecutionResult, PlanResult
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            orch = Orchestrator.__new__(Orchestrator)
+            orch.run_dir = root
+            orch.router = MagicMock()
+            orch.router.usage.summary.return_value = {
+                "total_calls": 0, "total_cost_usd": 0.0,
+                "cache_hit_ratio": 0.0, "per_role": {},
+                "total_input_tokens": 0, "total_output_tokens": 0,
+                "total_cache_creation_tokens": 0, "total_cache_read_tokens": 0,
+            }
+            plan = PlanResult(iteration=1, tasks=[], rationale="r")
+            fake_qa = MagicMock()
+            fake_qa.new_bugs = []; fake_qa.fixed_bugs = []; fake_qa.open_bugs = []
+            qa_fix_results = [
+                ExecutionResult(task_id="qa-aaaa", status="done", summary=""),
+                ExecutionResult(task_id="qa-bbbb", status="failed", summary=""),
+                ExecutionResult(task_id="qa-cccc", status="failed", summary=""),
+            ]
+            orch._emit_iter_changes_md(
+                1, plan=plan, results=[], qa_report=fake_qa,
+                qa_fix_results=qa_fix_results,
+                retired_this_iter=[], still_open_count=2,
+                elapsed_s=1.0, cost_delta_usd=0.0,
+            )
+            md = (root / "iter1_changes.md").read_text()
+            self.assertIn("fix tasks: 1 ok, 2 failed", md)
+
+
 class TestPlannerFeatureCap(unittest.TestCase):
     def test_planner_renders_min_max_from_feature_cap(self) -> None:
         from unittest.mock import MagicMock
