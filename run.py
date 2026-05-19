@@ -20,6 +20,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--qa-wontfix-after", type=int, default=3,
                    help="retire QA bugs after this many failed fix attempts "
                         "(default 3, 0=never retire)")
+    p.add_argument("--no-cache-analysis", action="store_true",
+                   help="force a fresh Analyzer run, ignoring "
+                        ".d2p/analysis_cache.json")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -33,7 +36,8 @@ def main(argv: list[str] | None = None) -> int:
     cfg.reanalyze_every = args.reanalyze_every
     cfg.qa_wontfix_after_attempts = args.qa_wontfix_after
     orch = Orchestrator(args.target, cfg=cfg, max_iterations=args.iter,
-                        parallel=args.parallel, enable_qa=not args.no_qa)
+                        parallel=args.parallel, enable_qa=not args.no_qa,
+                        use_analyzer_cache=not args.no_cache_analysis)
     orch.run()
     return 0
 

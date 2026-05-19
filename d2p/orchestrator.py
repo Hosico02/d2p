@@ -81,6 +81,7 @@ class Orchestrator:
                  parallel: int | None = None,
                  max_iterations: int | None = None,
                  enable_qa: bool = True,
+                 use_analyzer_cache: bool = True,
                  router: RoleRouter | None = None) -> None:
         self.cfg = cfg or Config()
         if parallel is not None:
@@ -88,6 +89,7 @@ class Orchestrator:
         if max_iterations is not None:
             self.cfg.max_iterations = max_iterations
         self.enable_qa = enable_qa
+        self.use_analyzer_cache = use_analyzer_cache
         self.sandbox = Sandbox(target_dir)
         # Per-role LLM router — Haiku/mini for hot path, Opus/4o for reasoning.
         # Defaults pulled from D2P_PROVIDER / role env overrides.
@@ -108,18 +110,32 @@ class Orchestrator:
     # ------------------------------------------------------------------ public
 
     def run(self) -> dict[str, Any]:
+        run_started = time.monotonic()
         log.info("d2p starting on %s", self.sandbox.root)
-        analysis = self.analyzer.run()
+        # Persistent analyzer cache keyed by codebase fingerprint. Lives
+        # alongside the target's .d2p dir but OUTSIDE this run's dir, so
+        # subsequent runs against the same demo skip the (slow + costly)
+        # web-search-fueled re-analysis when nothing changed.
+        cache_path = self.sandbox.root / ".d2p" / "analysis_cache.json"
+        analysis, hit = self.analyzer.run_cached(
+            cache_path, use_cache=self.use_analyzer_cache,
+        )
         self._dump("analysis.json", analysis.to_dict())
-        log.info("Analyzer: essence=%r audience=%r features=%d",
+        log.info("Analyzer (%s): essence=%r audience=%r features=%d",
+                 "cache HIT" if hit else "fresh",
                  analysis.essence[:80], analysis.audience, len(analysis.features))
 
         history: list[dict[str, Any]] = []
         open_bugs: list[dict[str, Any]] = []
+        # Cumulative cost at the start of each iter — diff with the next
+        # measurement gives the per-iter cost delta (cleaner than guessing
+        # from per-call records).
+        last_cost = self.router.usage.summary()["total_cost_usd"]
 
         bug_debt_threshold = 12        # P2: raised from 6 → 12
         always_min_features = 1        # P2: even under debt, always allow ≥1
         for it in range(1, self.cfg.max_iterations + 1):
+            iter_started = time.monotonic()
             log.info("=== iteration %d / %d ===", it, self.cfg.max_iterations)
 
             # Periodic re-analysis: refresh feature list mid-run, but preserve
@@ -266,8 +282,17 @@ class Orchestrator:
                     open_bugs = []
 
             done_fixes = sum(1 for r in qa_fix_results if r.status == "done")
+            iter_elapsed_s = round(time.monotonic() - iter_started, 1)
+            cur_cost = self.router.usage.summary()["total_cost_usd"]
+            iter_cost_delta = round(cur_cost - last_cost, 4)
+            last_cost = cur_cost
+            log.info("Iter %d done in %.1fs (cost delta=$%.4f, cum=$%.4f)",
+                     it, iter_elapsed_s, iter_cost_delta, cur_cost)
             history.append({
                 "iteration": it,
+                "elapsed_s": iter_elapsed_s,
+                "cost_delta_usd": iter_cost_delta,
+                "cumulative_cost_usd": cur_cost,
                 "plan_rationale": plan.rationale,
                 "results": [r.to_dict() for r in results],
                 "qa": qa_report.to_dict() if qa_report else None,
@@ -282,6 +307,8 @@ class Orchestrator:
                 it, plan=plan, results=results, qa_report=qa_report,
                 qa_fix_results=qa_fix_results,
                 retired_this_iter=retired_this_iter,
+                elapsed_s=iter_elapsed_s,
+                cost_delta_usd=iter_cost_delta,
             )
 
             # Convergence: stop iterating when NEITHER side made forward
@@ -292,15 +319,18 @@ class Orchestrator:
                          it)
                 break
 
+        total_elapsed_s = round(time.monotonic() - run_started, 1)
         summary = {
             "analysis": analysis.to_dict(),
             "iterations": history,
             "open_bugs": open_bugs,
             "run_dir": str(self.run_dir),
+            "elapsed_s": total_elapsed_s,
             "usage": self.router.usage.summary(),
         }
         self._dump("summary.json", summary)
-        log.info("d2p run complete. Artifacts in %s", self.run_dir)
+        log.info("d2p run complete in %.1fs. Artifacts in %s",
+                 total_elapsed_s, self.run_dir)
         log.info("Usage: %d calls, $%.4f total, cache_hit=%s",
                  summary["usage"]["total_calls"],
                  summary["usage"]["total_cost_usd"],
@@ -328,12 +358,16 @@ class Orchestrator:
     def _emit_iter_changes_md(self, it: int, *,
                               plan, results: list[ExecutionResult],
                               qa_report, qa_fix_results: list[ExecutionResult],
-                              retired_this_iter: list[str]) -> None:
+                              retired_this_iter: list[str],
+                              elapsed_s: float = 0.0,
+                              cost_delta_usd: float = 0.0) -> None:
         """Write iter{N}_changes.md — a human-readable digest of what moved
         this iteration. Far easier to skim than the JSON dumps when reviewing
         a multi-iter run."""
         lines: list[str] = []
         lines.append(f"# Iteration {it} — changes")
+        lines.append("")
+        lines.append(f"Elapsed: {elapsed_s:.1f}s  •  Cost delta: ${cost_delta_usd:.4f}")
         lines.append("")
         lines.append(f"Rationale: {plan.rationale or '(none)'}")
         lines.append("")
@@ -477,6 +511,10 @@ class Orchestrator:
         log.info("Task batch (role=%s) using %s", role, executor_llm.name)
         executors = [Executor(executor_llm, self.sandbox)
                      for _ in range(max_workers)]
+        fallback_llm = self.router.for_fallback(role)
+        if fallback_llm is not None:
+            log.info("Escalation available (role=%s): fallback=%s",
+                     role, fallback_llm.name)
         locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
         results: list[ExecutionResult] = []
         results_lock = threading.Lock()
@@ -491,22 +529,21 @@ class Orchestrator:
                     self.qa._run_test_file(tp)["status"] == "passed"
                 )
 
-        def _run(idx: int, task: Task) -> None:
+        def _attempt(task: Task, executor: Executor,
+                     pc) -> tuple[ExecutionResult, dict[str, Any]]:
+            """One attempt: acquire locks, snapshot, write, probe, rollback.
+            Returns (result, snapshot_taken)."""
             keys = sorted(set(task.target_files)) or [f"__notarget__:{task.id}"]
             acquired: list[threading.Lock] = []
-            pc = post_check_for(task) if post_check_for else None
             snapshot: dict[str, Any] = {}
             try:
                 for k in keys:
                     lk = locks[k]
                     lk.acquire()
                     acquired.append(lk)
-                # A) Snapshot is the only thing that MUST be inside the write
-                # lock — it has to capture the pre-write state atomically with
-                # the executor's writes. Health probes happen after release.
                 snapshot = self.sandbox.snapshot(task.target_files)
                 try:
-                    res = executors[idx % max_workers].run(task, post_check=pc)
+                    res = executor.run(task, post_check=pc)
                 except Exception as e:
                     res = ExecutionResult(task_id=task.id, status="failed",
                                           summary="", error=str(e))
@@ -514,8 +551,6 @@ class Orchestrator:
                 for lk in acquired:
                     lk.release()
 
-            # Post-task probes — OUTSIDE the lock (multiple tasks' subprocesses
-            # can run concurrently; this is the main speed win).
             if res.status == "done":
                 rolled = _rollback_if_health_regressed(
                     self.sandbox, self.health,
@@ -531,6 +566,28 @@ class Orchestrator:
                     res.error = ((res.error + " | ") if res.error else "") + \
                                 "regression detected — rolled back"
                     res.files_changed = []
+            return res, snapshot
+
+        def _run(idx: int, task: Task) -> None:
+            pc = post_check_for(task) if post_check_for else None
+            res, _snapshot = _attempt(task, executors[idx % max_workers], pc)
+
+            # Escalation: if the primary executor failed AND a fallback model
+            # is wired for this role, retry once with the stronger model.
+            # The sandbox is already rolled back to the pre-task state, so the
+            # second attempt starts from the same baseline as the first.
+            if res.status != "done" and fallback_llm is not None:
+                log.info("task %s failed (%s) — escalating to %s",
+                         task.id, (res.error or "")[:80], fallback_llm.name)
+                fb_executor = Executor(fallback_llm, self.sandbox)
+                fb_res, _ = _attempt(task, fb_executor, pc)
+                if fb_res.status == "done":
+                    fb_res.summary = (fb_res.summary or "") + " [escalated]"
+                    res = fb_res
+                else:
+                    # keep the original error too — debug visibility for users
+                    # who want to know which model failed which way
+                    res.error = (res.error or "") + f" | escalation also failed: {(fb_res.error or '')[:120]}"
 
             log.info("task %s [%s] -> %s (%d files)",
                      task.id, task.title[:60], res.status, len(res.files_changed))

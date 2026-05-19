@@ -1,5 +1,7 @@
 # d2p — Demo to Product
 
+[![CI](https://github.com/Hosico02/d2p/actions/workflows/ci.yml/badge.svg)](https://github.com/Hosico02/d2p/actions/workflows/ci.yml)
+
 A multi-agent loop that turns a **demo repo** into a **product repo**. No
 hardcoded "demo type" detectors — the agents read the project, search the
 web for mature competitor products in the same domain, and figure the rest
@@ -124,6 +126,7 @@ Flags:
 | `--no-qa` | off | skip the QA stage (faster, but no failing-test guardrails added) |
 | `--reanalyze-every N` | 0 | re-run Analyzer every N iters (essence/audience pinned); 0 disables |
 | `--qa-wontfix-after N` | 3 | retire a QA bug after N failed fix attempts; 0 disables |
+| `--no-cache-analysis` | off | force a fresh Analyzer call (ignore `.d2p/analysis_cache.json`) |
 | `-v` | off | verbose logs |
 
 Example:
@@ -225,6 +228,23 @@ Haiku is fine for feature edits (10× cheaper than Opus and fast enough);
 fixes need Sonnet to climb past ~0% success on harder bugs. Opus is
 reserved for Analyzer / Planner / QA where reasoning quality dominates.
 
+### Auto-escalation on task failure
+
+Any role can have a fallback model wired via env. When the primary
+provider fails a task (regression rollback, syntax fail, SEARCH miss),
+the orchestrator retries once with the fallback before giving up:
+
+```bash
+# Primary haiku, escalate to sonnet only when haiku fails:
+D2P_PROVIDER=claude-cli \
+D2P_ROLE_EXECUTOR_FALLBACK_MODEL=sonnet \
+D2P_ROLE_FIX_FALLBACK_MODEL=sonnet \
+python run.py <demo> --iter 2
+```
+
+Fallback usage is tagged as `<role>-fallback` in `summary.json`, so the
+cost of escalations is separately visible from the cheap-model baseline.
+
 ### Cost & cache visibility
 
 Every provider call routes through a shared `UsageAccumulator`. At the
@@ -284,6 +304,17 @@ After `--qa-wontfix-after N` failed attempts the bug flips to `wontfix`:
 the test stays in the corpus (so future runs notice if it accidentally
 turns green — the system will flip it back to `fixed`), but the
 orchestrator stops dispatching the same broken fix forever.
+
+### Analyzer caching
+
+The Analyzer call is slow (web search + JSON-mode reasoning over the
+whole codebase) and largely deterministic for a stable codebase. d2p
+fingerprints the analyzer's input (`listing + key file contents + model
+identity + system prompt`) and stores results in
+`<target>/.d2p/analysis_cache.json`. Subsequent runs against the same
+demo are an instant cache hit. Pass `--no-cache-analysis` to force a
+fresh run (e.g. when you've changed competitors or want fresh web
+findings).
 
 ---
 

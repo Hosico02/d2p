@@ -753,5 +753,184 @@ class TestIterChangesMarkdown(unittest.TestCase):
             self.assertIn("0.0123", md)
 
 
+class TestIterChangesMarkdownTiming(unittest.TestCase):
+    def test_md_includes_elapsed_and_cost_delta(self) -> None:
+        from unittest.mock import MagicMock
+        from d2p.orchestrator import Orchestrator
+        from d2p.models import ExecutionResult, PlanResult, Task
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            orch = Orchestrator.__new__(Orchestrator)
+            orch.run_dir = root
+            orch.router = MagicMock()
+            orch.router.usage.summary.return_value = {
+                "total_calls": 0, "total_cost_usd": 0.0,
+                "cache_hit_ratio": 0.0, "per_role": {},
+                "total_input_tokens": 0, "total_output_tokens": 0,
+                "total_cache_creation_tokens": 0, "total_cache_read_tokens": 0,
+            }
+            plan = PlanResult(iteration=1, tasks=[], rationale="why")
+            orch._emit_iter_changes_md(
+                1, plan=plan, results=[], qa_report=None,
+                qa_fix_results=[], retired_this_iter=[],
+                elapsed_s=42.7, cost_delta_usd=0.0512,
+            )
+            md = (root / "iter1_changes.md").read_text()
+            self.assertIn("Elapsed: 42.7s", md)
+            self.assertIn("$0.0512", md)
+
+
+class TestAnalyzerFingerprint(unittest.TestCase):
+    """The fingerprint determines analyzer-cache hit/miss. Two runs with
+    identical inputs must produce identical fingerprints; any input change
+    must shift it."""
+
+    def _make_analyzer(self, root: Path):
+        from d2p.agents import Analyzer
+        from d2p.fs import Sandbox
+        from unittest.mock import MagicMock
+        sb = Sandbox(root)
+        llm = MagicMock()
+        llm.name = "test-model@analyzer"
+        return Analyzer(llm, sb)
+
+    def test_same_input_same_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "app.py").write_text("print(1)\n")
+            (root / "README.md").write_text("# Demo\n")
+            a = self._make_analyzer(root)
+            self.assertEqual(a.fingerprint(), a.fingerprint())
+
+    def test_listing_change_shifts_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "app.py").write_text("print(1)\n")
+            a = self._make_analyzer(root)
+            fp1 = a.fingerprint()
+            (root / "new_file.py").write_text("x=1\n")
+            self.assertNotEqual(a.fingerprint(), fp1)
+
+    def test_doc_change_shifts_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "README.md").write_text("# v1\n")
+            a = self._make_analyzer(root)
+            fp1 = a.fingerprint()
+            (root / "README.md").write_text("# v2\n")
+            self.assertNotEqual(a.fingerprint(), fp1)
+
+    def test_model_change_shifts_fingerprint(self) -> None:
+        from d2p.agents import Analyzer
+        from d2p.fs import Sandbox
+        from unittest.mock import MagicMock
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "README.md").write_text("# x\n")
+            sb = Sandbox(root)
+            llm1 = MagicMock(); llm1.name = "haiku"
+            llm2 = MagicMock(); llm2.name = "opus"
+            a1 = Analyzer(llm1, sb)
+            a2 = Analyzer(llm2, sb)
+            self.assertNotEqual(a1.fingerprint(), a2.fingerprint())
+
+
+class TestAnalyzerCachedRoundtrip(unittest.TestCase):
+    def test_hit_skips_llm(self) -> None:
+        from d2p.agents import Analyzer
+        from d2p.fs import Sandbox
+        from unittest.mock import MagicMock
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "README.md").write_text("# x\n")
+            sb = Sandbox(root)
+            llm = MagicMock()
+            llm.name = "m"
+            llm.chat_json.return_value = {
+                "domain": "X", "essence": "E", "audience": "A",
+                "features": [{"name": "f1", "category": "ux",
+                              "description": "d", "source": "s"}],
+                "competitors": ["c1"], "ui_elements": ["u"],
+                "raw_notes": "n",
+            }
+            a = Analyzer(llm, sb)
+            cache_path = root / ".d2p" / "analysis_cache.json"
+            r1, hit1 = a.run_cached(cache_path)
+            r2, hit2 = a.run_cached(cache_path)
+            self.assertFalse(hit1)
+            self.assertTrue(hit2)
+            self.assertEqual(llm.chat_json.call_count, 1)
+            self.assertEqual(r1.essence, r2.essence)
+            self.assertEqual([f.name for f in r1.features],
+                             [f.name for f in r2.features])
+
+    def test_no_cache_flag_forces_fresh(self) -> None:
+        from d2p.agents import Analyzer
+        from d2p.fs import Sandbox
+        from unittest.mock import MagicMock
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "README.md").write_text("# x\n")
+            sb = Sandbox(root)
+            llm = MagicMock()
+            llm.name = "m"
+            llm.chat_json.return_value = {
+                "domain": "X", "essence": "E", "audience": "A",
+                "features": [], "competitors": [], "ui_elements": [],
+                "raw_notes": "",
+            }
+            a = Analyzer(llm, sb)
+            cache_path = root / ".d2p" / "analysis_cache.json"
+            a.run_cached(cache_path)
+            a.run_cached(cache_path, use_cache=False)
+            self.assertEqual(llm.chat_json.call_count, 2)
+
+
+class TestRouterFallback(unittest.TestCase):
+    def test_for_fallback_returns_none_when_absent(self) -> None:
+        from d2p.providers.base import RoleRouter
+
+        class P:
+            def __init__(self, n): self.name = n
+            def chat(self, *a, **k): return ""
+            def chat_json(self, *a, **k): return {}
+        r = RoleRouter({"default": P("d"), "executor": P("e")})
+        self.assertIsNone(r.for_fallback("executor"))
+
+    def test_for_fallback_returns_provider_when_set(self) -> None:
+        from d2p.providers.base import RoleRouter
+
+        class P:
+            def __init__(self, n): self.name = n
+            def chat(self, *a, **k): return ""
+            def chat_json(self, *a, **k): return {}
+        primary = P("haiku")
+        fallback = P("sonnet")
+        r = RoleRouter({"default": primary, "executor": primary},
+                       fallbacks={"executor": fallback})
+        self.assertIs(r.for_fallback("executor"), fallback)
+        self.assertIsNone(r.for_fallback("planner"))
+        # describe() exposes the fallback under <role>-fallback
+        d = r.describe()
+        self.assertIn("executor-fallback", d)
+        self.assertEqual(d["executor-fallback"], "sonnet")
+
+    def test_provider_spec_reads_fallback_env(self) -> None:
+        import os as _os
+        from d2p.providers import _from_env
+        old = _os.environ.copy()
+        try:
+            _os.environ["D2P_PROVIDER"] = "minimax"
+            _os.environ["MINIMAX_API_KEY"] = "sk-cp-test"
+            _os.environ["D2P_ROLE_EXECUTOR_FALLBACK_MODEL"] = "MiniMax-strong"
+            _os.environ["D2P_ROLE_FIX_FALLBACK_MODEL"] = "MiniMax-strong"
+            spec = _from_env()
+            self.assertEqual(spec.fallback_models.get("executor"), "MiniMax-strong")
+            self.assertEqual(spec.fallback_models.get("fix"), "MiniMax-strong")
+        finally:
+            _os.environ.clear()
+            _os.environ.update(old)
+
+
 if __name__ == "__main__":
     unittest.main()
