@@ -59,7 +59,9 @@ class BugReport:
     summary: str
     suspected_files: list[str] = field(default_factory=list)
     last_failure: str = ""           # truncated stderr/stdout from the failing run
-    status: str = "open"             # open | fixed | flaky
+    status: str = "open"             # open | fixed | flaky | wontfix
+    attempts: int = 0                # how many fix tasks the orchestrator ran
+    first_seen_iter: int = 0         # iter where the bug was first discovered
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -67,6 +69,8 @@ class BugReport:
             "category": self.category, "summary": self.summary,
             "suspected_files": self.suspected_files,
             "last_failure": self.last_failure, "status": self.status,
+            "attempts": self.attempts,
+            "first_seen_iter": self.first_seen_iter,
         }
 
 
@@ -75,6 +79,7 @@ class QAReport:
     new_bugs: list[BugReport]
     open_bugs: list[BugReport]       # bugs known from prior runs that still fail
     fixed_bugs: list[BugReport]      # previously failing tests that now pass
+    retired_bugs: list[BugReport]    # marked wontfix because too many attempts
     test_runs: dict[str, Any]        # raw test runner output by path
 
     def to_dict(self) -> dict[str, Any]:
@@ -82,6 +87,7 @@ class QAReport:
             "new_bugs": [b.to_dict() for b in self.new_bugs],
             "open_bugs": [b.to_dict() for b in self.open_bugs],
             "fixed_bugs": [b.to_dict() for b in self.fixed_bugs],
+            "retired_bugs": [b.to_dict() for b in self.retired_bugs],
             "test_runs": self.test_runs,
         }
 
@@ -200,13 +206,17 @@ class QAAgent:
     def _pick_test_python(self) -> str:
         """Pick a python interpreter that can import the project's dependencies.
 
-        Strategy: collect top-level non-stdlib imports from the project's entry
-        files; try each candidate interpreter (system python3 first, then
-        d2p's sys.executable); use the first one that imports them all.
+        Prefer 3.10+ (Hosico-style conda envs, homebrew) over the macOS-default
+        /usr/bin/python3=3.9 which can't even parse modern demos with PEP-604
+        unions. Then fall back to system python and d2p's own interpreter.
         """
-        candidates = []
+        from .lang.python import _pick_python_310plus
+        candidates: list[str] = []
+        modern = _pick_python_310plus()
+        if modern:
+            candidates.append(modern)
         sys_python = shutil.which("python3") or shutil.which("python")
-        if sys_python and sys_python != sys.executable:
+        if sys_python and sys_python not in candidates and sys_python != sys.executable:
             candidates.append(sys_python)
         candidates.append(sys.executable)
 
@@ -255,7 +265,8 @@ class QAAgent:
 
     def run(self, *, analysis_summary: str, essence: str, audience: str,
             key_files_block: str,
-            symbol_map: dict[str, list[str]]) -> tuple[QAReport, list[Task]]:
+            symbol_map: dict[str, list[str]],
+            iteration: int = 1) -> tuple[QAReport, list[Task]]:
         self._ensure_corpus_dir()
         existing = self._list_existing_tests()
 
@@ -263,11 +274,13 @@ class QAAgent:
         prior_runs: dict[str, Any] = {}
         prior_failed: list[BugReport] = []
         prior_fixed: list[BugReport] = []
+        retired_still_failing: list[BugReport] = []
         prior_meta = self._load_meta()
         for rel in existing:
             outcome = self._run_test_file(rel)
             prior_runs[rel] = outcome
             meta = prior_meta.get(rel, {})
+            prior_status = meta.get("status", "open")
             if outcome["status"] != "passed":
                 br = BugReport(
                     id=meta.get("id", uuid.uuid4().hex[:8]),
@@ -277,11 +290,22 @@ class QAAgent:
                     summary=meta.get("title", ""),
                     suspected_files=meta.get("suspected_files", []),
                     last_failure=outcome["output"][-1500:],
-                    status="open",
+                    status=prior_status if prior_status == "wontfix" else "open",
+                    attempts=int(meta.get("attempts", 0) or 0),
+                    first_seen_iter=int(meta.get("first_seen_iter", 0) or 0) or iteration,
                 )
-                prior_failed.append(br)
+                # Retired bugs stay in the corpus (so we'd notice if they
+                # accidentally turn green) but we don't ask executors to keep
+                # trying to fix them.
+                if prior_status == "wontfix":
+                    retired_still_failing.append(br)
+                else:
+                    prior_failed.append(br)
             else:
-                if meta.get("status") == "open":
+                # Test now passes. If it was previously open or wontfix, that's
+                # a fix worth recording (wontfix flipping green is a happy
+                # surprise — flip it to fixed).
+                if prior_status in ("open", "wontfix"):
                     prior_fixed.append(BugReport(
                         id=meta.get("id", uuid.uuid4().hex[:8]),
                         title=meta.get("title", rel),
@@ -290,6 +314,8 @@ class QAAgent:
                         summary=meta.get("title", ""),
                         suspected_files=meta.get("suspected_files", []),
                         status="fixed",
+                        attempts=int(meta.get("attempts", 0) or 0),
+                        first_seen_iter=int(meta.get("first_seen_iter", 0) or 0),
                     ))
 
         # 2. probe for new bugs (LLM-driven) — no throttle. The real fix to
@@ -310,20 +336,23 @@ class QAAgent:
             prior_runs[br.test_path] = outcome
             if outcome["status"] != "passed":
                 br.last_failure = outcome["output"][-1500:]
+                br.first_seen_iter = iteration
                 confirmed_new.append(br)
             else:
                 # the model misjudged — the "bug" isn't real. Delete the test to
                 # avoid polluting the corpus with green-on-arrival noise.
                 self.sandbox.delete(br.test_path)
 
-        # 4. persist meta
+        # 4. persist meta. Failing bugs that haven't been retired get fix
+        # tasks; retired (wontfix) bugs stay tracked but skip dispatch.
         all_failing = prior_failed + confirmed_new
-        self._save_meta(all_failing, prior_fixed)
+        self._save_meta(all_failing + retired_still_failing, prior_fixed)
 
         report = QAReport(
             new_bugs=confirmed_new,
             open_bugs=prior_failed,
             fixed_bugs=prior_fixed,
+            retired_bugs=retired_still_failing,
             test_runs=prior_runs,
         )
         fix_tasks = [self._bug_to_task(b) for b in all_failing]
@@ -392,7 +421,10 @@ class QAAgent:
                    fixed: list[BugReport]) -> None:
         prior = self._load_meta()
         for b in failing:
-            prior[b.test_path] = {**b.to_dict(), "status": "open"}
+            # Preserve the bug's tracked status (open vs wontfix) instead of
+            # blindly overwriting to "open" — otherwise a retired bug would
+            # reset to "open" on every QA sweep.
+            prior[b.test_path] = {**b.to_dict()}
         for b in fixed:
             prior[b.test_path] = {**b.to_dict(), "status": "fixed"}
         self.sandbox.write(f"{self.corpus_dir}/_meta.json",
@@ -408,6 +440,31 @@ class QAAgent:
         prior[test_path]["status"] = status
         self.sandbox.write(f"{self.corpus_dir}/_meta.json",
                            json.dumps(prior, ensure_ascii=False, indent=2))
+
+    def bump_attempts(self, test_path: str) -> int:
+        """Increment the attempt counter for a still-failing bug after a fix
+        round. Returns the new attempt count. Used by orchestrator to decide
+        whether to retire the bug (mark wontfix)."""
+        prior = self._load_meta()
+        if test_path not in prior:
+            return 0
+        n = int(prior[test_path].get("attempts", 0) or 0) + 1
+        prior[test_path]["attempts"] = n
+        self.sandbox.write(f"{self.corpus_dir}/_meta.json",
+                           json.dumps(prior, ensure_ascii=False, indent=2))
+        return n
+
+    def mark_wontfix(self, test_path: str) -> None:
+        """Retire a bug: keep the test in the corpus (so future runs notice
+        if it goes green) but stop dispatching fix tasks for it."""
+        prior = self._load_meta()
+        if test_path not in prior:
+            return
+        prior[test_path]["status"] = "wontfix"
+        self.sandbox.write(f"{self.corpus_dir}/_meta.json",
+                           json.dumps(prior, ensure_ascii=False, indent=2))
+        log.info("QA retired bug %s as wontfix (attempts=%s)",
+                 test_path, prior[test_path].get("attempts", "?"))
 
     def _run_test_file(self, rel_path: str) -> dict[str, Any]:
         """Run one test file via the adapter's runner. Python falls back to

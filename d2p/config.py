@@ -30,6 +30,16 @@ class Config:
     max_iterations: int = 3
     parallel_executors: int = 4
     request_timeout: int = 240
+    # Re-run the Analyzer every N iterations (0 = never, only at iter 1).
+    # Use case: long runs where the project drifts away from the initial
+    # feature plan; re-analysis refreshes the feature list while ESSENCE
+    # and AUDIENCE remain immutable invariants.
+    reanalyze_every: int = 0
+    # Mark a QA bug as `wontfix` after this many failed fix attempts so the
+    # orchestrator stops dispatching the same broken fix forever. The test
+    # stays in the corpus — if it ever turns green later, it gets flipped
+    # back to "fixed" automatically.
+    qa_wontfix_after_attempts: int = 3
 
     def require_key(self) -> None:
         if not self.api_key:

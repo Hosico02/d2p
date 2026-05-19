@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from .base import LLMProvider, RoleRouter
+from .base import LLMProvider, RoleRouter, UsageAccumulator
 from .claude import ClaudeProvider
 from .claude_cli import ClaudeCLIProvider
 from .codex import CodexProvider
@@ -19,6 +19,7 @@ from .minimax import MiniMaxProvider
 DEFAULT_ROLE_MODELS: dict[str, dict[str, str]] = {
     "claude": {
         "executor":  "claude-haiku-4-5",
+        "fix":       "claude-haiku-4-5",       # override to claude-sonnet-4-6 / opus when bugs resist
         "analyzer":  "claude-opus-4-7",
         "planner":   "claude-opus-4-7",
         "qa":        "claude-opus-4-7",
@@ -26,6 +27,7 @@ DEFAULT_ROLE_MODELS: dict[str, dict[str, str]] = {
     },
     "codex": {
         "executor":  "gpt-4o-mini",
+        "fix":       "gpt-4o-mini",
         "analyzer":  "gpt-4o",
         "planner":   "gpt-4o",
         "qa":        "gpt-4o",
@@ -33,11 +35,11 @@ DEFAULT_ROLE_MODELS: dict[str, dict[str, str]] = {
     },
     "minimax": {
         # MiniMax is single-model: one model for every role unless overridden.
-        # Empty dict = always use the provider's configured default model.
     },
     "claude-cli": {
-        # Same Hiku/Opus split as Claude API, just via the CLI binary.
+        # Hiku for hot path; fix uses sonnet by default (harder than feature edits)
         "executor":  "haiku",
+        "fix":       "haiku",                  # override via D2P_ROLE_FIX_MODEL=sonnet|opus
         "analyzer":  "opus",
         "planner":   "opus",
         "qa":        "opus",
@@ -81,7 +83,7 @@ def _from_env() -> ProviderSpec:
 
     # role overrides from env (D2P_ROLE_EXECUTOR_MODEL=...)
     overrides: dict[str, str] = {}
-    for role in ("executor", "analyzer", "planner", "qa", "default"):
+    for role in ("executor", "fix", "analyzer", "planner", "qa", "default"):
         env_name = f"D2P_ROLE_{role.upper()}_MODEL"
         v = os.environ.get(env_name)
         if v:
@@ -96,19 +98,20 @@ def _from_env() -> ProviderSpec:
 
 def _make_provider(kind: str, *, api_key: str, base_url: str,
                    model: str, role: str,
-                   working_dir: str | None = None) -> LLMProvider:
+                   working_dir: str | None = None,
+                   usage: UsageAccumulator | None = None) -> LLMProvider:
     if kind == "claude":
         return ClaudeProvider(api_key=api_key, model=model,
-                              base_url=base_url or None, role=role)
+                              base_url=base_url or None, role=role, usage=usage)
     if kind == "claude-cli":
         return ClaudeCLIProvider(model=model, role=role,
-                                  working_dir=working_dir)
+                                  working_dir=working_dir, usage=usage)
     if kind == "codex":
         return CodexProvider(api_key=api_key, model=model,
-                             base_url=base_url or None, role=role)
+                             base_url=base_url or None, role=role, usage=usage)
     return MiniMaxProvider(api_key=api_key, model=model,
                            base_url=base_url or "https://api.minimaxi.com/anthropic",
-                           role=role)
+                           role=role, usage=usage)
 
 
 def build_router(spec: ProviderSpec | None = None,
@@ -129,26 +132,33 @@ def build_router(spec: ProviderSpec | None = None,
         raise RuntimeError(
             f"No API key for provider {s.kind}. Set the appropriate env: {env_var}"
         )
+    usage = UsageAccumulator()
     providers: dict[str, LLMProvider] = {}
     providers["default"] = _make_provider(
         s.kind, api_key=s.api_key, base_url=s.base_url,
         model=s.role_models.get("default", s.default_model), role="default",
-        working_dir=working_dir,
+        working_dir=working_dir, usage=usage,
     )
-    for role in ("executor", "analyzer", "planner", "qa"):
+    for role in ("executor", "fix", "analyzer", "planner", "qa"):
         m = s.role_models.get(role, s.default_model)
         if m == s.role_models.get("default", s.default_model):
-            providers[role] = providers["default"]
+            # Share the default provider — BUT a single provider instance has
+            # a fixed `role` label, so usage attribution would all bucket as
+            # 'default'. Construct a tiny per-role provider so usage is split.
+            providers[role] = _make_provider(
+                s.kind, api_key=s.api_key, base_url=s.base_url, model=m,
+                role=role, working_dir=working_dir, usage=usage,
+            )
             continue
         providers[role] = _make_provider(
             s.kind, api_key=s.api_key, base_url=s.base_url, model=m, role=role,
-            working_dir=working_dir,
+            working_dir=working_dir, usage=usage,
         )
-    return RoleRouter(providers)
+    return RoleRouter(providers, usage=usage)
 
 
 __all__ = [
-    "LLMProvider", "RoleRouter", "ProviderSpec",
+    "LLMProvider", "RoleRouter", "ProviderSpec", "UsageAccumulator",
     "MiniMaxProvider", "ClaudeProvider", "ClaudeCLIProvider", "CodexProvider",
     "build_router", "DEFAULT_ROLE_MODELS",
 ]

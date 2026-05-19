@@ -582,5 +582,176 @@ class TestHealthRollback(unittest.TestCase):
         self.assertIn("new()", self.sb.read("helpers.py"))
 
 
+class TestUsageAccumulator(unittest.TestCase):
+    def test_accumulates_and_summarises(self) -> None:
+        from d2p.providers.base import UsageAccumulator
+        u = UsageAccumulator()
+        u.add(role="executor", model="haiku",
+              input_tokens=10, output_tokens=20,
+              cache_creation_tokens=100, cache_read_tokens=0, cost_usd=0.001)
+        u.add(role="executor", model="haiku",
+              input_tokens=5, output_tokens=8,
+              cache_creation_tokens=0, cache_read_tokens=100, cost_usd=0.0005)
+        u.add(role="planner", model="opus",
+              input_tokens=200, output_tokens=300, cost_usd=0.02)
+        s = u.summary()
+        self.assertEqual(s["total_calls"], 3)
+        self.assertAlmostEqual(s["total_cost_usd"], 0.0215, places=4)
+        # cache hit ratio = read / (read+creation) = 100 / 200 = 0.5
+        self.assertEqual(s["cache_hit_ratio"], 0.5)
+        self.assertIn("executor:haiku", s["per_role"])
+        self.assertEqual(s["per_role"]["executor:haiku"]["calls"], 2)
+        self.assertEqual(s["per_role"]["executor:haiku"]["input"], 15)
+        self.assertEqual(s["per_role"]["planner:opus"]["calls"], 1)
+
+    def test_threadsafe_concurrent_add(self) -> None:
+        import threading
+        from d2p.providers.base import UsageAccumulator
+        u = UsageAccumulator()
+        def worker():
+            for _ in range(50):
+                u.add(role="executor", model="haiku",
+                      input_tokens=1, output_tokens=1)
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        self.assertEqual(u.summary()["total_calls"], 200)
+
+
+class TestQAWontfix(unittest.TestCase):
+    def _make_qa(self, root: Path) -> "object":
+        from d2p.qa import QAAgent
+        (root / "tests" / "d2p_qa").mkdir(parents=True, exist_ok=True)
+        sb = Sandbox(root)
+        qa = QAAgent.__new__(QAAgent)
+        qa.sandbox = sb
+        qa.corpus_dir = "tests/d2p_qa"
+        return qa
+
+    def test_bump_attempts_increments(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "tests" / "d2p_qa").mkdir(parents=True)
+            (root / "tests" / "d2p_qa" / "_meta.json").write_text(json.dumps({
+                "tests/d2p_qa/test_x.py": {
+                    "id": "a", "title": "t",
+                    "test_path": "tests/d2p_qa/test_x.py",
+                    "category": "x", "summary": "t",
+                    "suspected_files": [], "last_failure": "",
+                    "status": "open", "attempts": 0,
+                }
+            }))
+            qa = self._make_qa(root)
+            n1 = qa.bump_attempts("tests/d2p_qa/test_x.py")
+            n2 = qa.bump_attempts("tests/d2p_qa/test_x.py")
+            self.assertEqual(n1, 1)
+            self.assertEqual(n2, 2)
+            meta = json.loads((root / "tests/d2p_qa/_meta.json").read_text())
+            self.assertEqual(meta["tests/d2p_qa/test_x.py"]["attempts"], 2)
+
+    def test_bump_unknown_path_returns_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "tests" / "d2p_qa").mkdir(parents=True)
+            (root / "tests" / "d2p_qa" / "_meta.json").write_text("{}")
+            qa = self._make_qa(root)
+            self.assertEqual(qa.bump_attempts("nope.py"), 0)
+
+    def test_mark_wontfix_flips_status(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "tests" / "d2p_qa").mkdir(parents=True)
+            (root / "tests" / "d2p_qa" / "_meta.json").write_text(json.dumps({
+                "tests/d2p_qa/test_y.py": {
+                    "id": "b", "title": "t",
+                    "test_path": "tests/d2p_qa/test_y.py",
+                    "category": "x", "summary": "t",
+                    "suspected_files": [], "last_failure": "",
+                    "status": "open", "attempts": 3,
+                }
+            }))
+            qa = self._make_qa(root)
+            qa.mark_wontfix("tests/d2p_qa/test_y.py")
+            meta = json.loads((root / "tests/d2p_qa/_meta.json").read_text())
+            self.assertEqual(meta["tests/d2p_qa/test_y.py"]["status"], "wontfix")
+
+
+class TestClaudeCLIPromptPrefixStable(unittest.TestCase):
+    """The cache-friendly prompt layout puts variable knobs at the END so the
+    bytewise prefix up to the user block stays identical across retries with
+    different temperature/max_tokens. Regression test for d2p prompt caching."""
+
+    def _build(self, **call_kwargs):
+        from d2p.providers.claude_cli import ClaudeCLIProvider
+        p = ClaudeCLIProvider.__new__(ClaudeCLIProvider)
+        p.role = "executor"
+        return p._build_prompt("SYS", "USER",
+                               web_search=call_kwargs.get("web_search", False),
+                               json_mode=call_kwargs.get("json_mode", False),
+                               temperature=call_kwargs.get("temperature", 0.4),
+                               max_tokens=call_kwargs.get("max_tokens", 4096))
+
+    def test_stable_prefix_across_temperatures(self) -> None:
+        a = self._build(temperature=0.3, max_tokens=4096)
+        b = self._build(temperature=0.7, max_tokens=4096)
+        # Find the divergence point — must be inside "Call options" block.
+        for i, (ca, cb) in enumerate(zip(a, b)):
+            if ca != cb:
+                self.assertIn("=== Call options ===", a[:i])
+                self.assertIn("=== Call options ===", b[:i])
+                return
+        # If they're identical, fine (no per-call info present)
+        self.assertEqual(a, b)
+
+    def test_user_block_appears_before_call_options(self) -> None:
+        prompt = self._build()
+        user_idx = prompt.index("=== User ===")
+        opts_idx = prompt.index("=== Call options ===")
+        self.assertLess(user_idx, opts_idx,
+                        "User block must precede Call options for cache prefix")
+
+
+class TestIterChangesMarkdown(unittest.TestCase):
+    def test_emit_basic_digest(self) -> None:
+        from unittest.mock import MagicMock
+        from d2p.orchestrator import Orchestrator
+        from d2p.models import ExecutionResult, PlanResult, Task
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            # synthesise an Orchestrator without running build_router
+            orch = Orchestrator.__new__(Orchestrator)
+            orch.run_dir = root
+            orch.router = MagicMock()
+            orch.router.usage.summary.return_value = {
+                "total_calls": 5, "total_cost_usd": 0.0123,
+                "cache_hit_ratio": 0.7, "per_role": {},
+                "total_input_tokens": 0, "total_output_tokens": 0,
+                "total_cache_creation_tokens": 0, "total_cache_read_tokens": 0,
+            }
+            plan = PlanResult(iteration=1, tasks=[
+                Task(id="t1", title="Add login", rationale="x",
+                     target_files=["auth.py"], instructions="",
+                     priority=1, category="feature"),
+            ], rationale="why these tasks")
+            results = [
+                ExecutionResult(task_id="t1", status="done",
+                                summary="ok", files_changed=["auth.py"]),
+            ]
+            fake_qa = MagicMock()
+            fake_qa.new_bugs = []
+            fake_qa.fixed_bugs = []
+            fake_qa.open_bugs = []
+            orch._emit_iter_changes_md(
+                1, plan=plan, results=results, qa_report=fake_qa,
+                qa_fix_results=[], retired_this_iter=[],
+            )
+            md = (root / "iter1_changes.md").read_text()
+            self.assertIn("# Iteration 1", md)
+            self.assertIn("Add login", md)
+            self.assertIn("auth.py", md)
+            self.assertIn("Cumulative usage", md)
+            self.assertIn("0.0123", md)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -122,6 +122,24 @@ class Orchestrator:
         for it in range(1, self.cfg.max_iterations + 1):
             log.info("=== iteration %d / %d ===", it, self.cfg.max_iterations)
 
+            # Periodic re-analysis: refresh feature list mid-run, but preserve
+            # essence/audience invariants (changing them mid-run would defeat
+            # the whole purpose of having them).
+            if (self.cfg.reanalyze_every and it > 1
+                    and (it - 1) % self.cfg.reanalyze_every == 0):
+                log.info("Re-running Analyzer (reanalyze_every=%d)",
+                         self.cfg.reanalyze_every)
+                try:
+                    fresh = self.analyzer.run()
+                    fresh.essence = analysis.essence
+                    fresh.audience = analysis.audience
+                    analysis = fresh
+                    self._dump(f"analysis_iter{it}.json", analysis.to_dict())
+                    log.info("Re-analyzed: features now %d",
+                             len(analysis.features))
+                except Exception as e:
+                    log.warning("re-analysis failed, keeping prior: %s", e)
+
             # P2 SOFT THROTTLE: when backlog is high, RUN FEWER feature tasks
             # rather than dropping them entirely. Always allow at least
             # `always_min_features` so the product keeps moving — fully
@@ -157,12 +175,14 @@ class Orchestrator:
             qa_report = None
             qa_fix_results: list[ExecutionResult] = []
             regressions: list[dict[str, Any]] = []
+            retired_this_iter: list[str] = []
             if self.qa is not None:
-                qa_report, fix_tasks = self._run_qa(analysis)
+                qa_report, fix_tasks = self._run_qa(analysis, iteration=it)
                 self._dump(f"qa_iter{it}.json", qa_report.to_dict())
-                log.info("QA: new_bugs=%d open_bugs=%d fixed=%d",
+                log.info("QA: new_bugs=%d open_bugs=%d fixed=%d retired=%d",
                          len(qa_report.new_bugs), len(qa_report.open_bugs),
-                         len(qa_report.fixed_bugs))
+                         len(qa_report.fixed_bugs),
+                         len(qa_report.retired_bugs))
                 if fix_tasks:
                     # 1) snapshot the entire test-result baseline + all files
                     # the fix tasks might touch, BEFORE running fixes.
@@ -190,7 +210,7 @@ class Orchestrator:
                         return self._qa_fix_post_check(path) if path else None
 
                     qa_fix_results = self._run_tasks_parallel(
-                        fix_tasks, post_check_for=_pc_for)
+                        fix_tasks, post_check_for=_pc_for, role="fix")
                     self._dump(f"qa_fix_iter{it}.json",
                                [r.to_dict() for r in qa_fix_results])
 
@@ -220,22 +240,56 @@ class Orchestrator:
                     self._dump(f"qa_regressions_iter{it}.json", regressions)
                     still_open = [b for b in (qa_report.new_bugs + qa_report.open_bugs)
                                   if post_runs.get(b.test_path, {}).get("status") != "passed"]
-                    log.info("After fix+regression-sweep: %d bugs still open",
-                             len(still_open))
-                    open_bugs = [b.to_dict() for b in still_open]
+
+                    # Retire bugs that have racked up too many failed attempts.
+                    # The test stays in the corpus (so it still flags if it
+                    # accidentally turns green), but no more fix tasks are
+                    # generated for it — frees the next iters to work on
+                    # features and bugs that haven't burned the budget yet.
+                    threshold = self.cfg.qa_wontfix_after_attempts
+                    survivors: list = []
+                    for b in still_open:
+                        n = self.qa.bump_attempts(b.test_path)
+                        if threshold and n >= threshold:
+                            self.qa.mark_wontfix(b.test_path)
+                            retired_this_iter.append(b.test_path)
+                        else:
+                            survivors.append(b)
+                    if retired_this_iter:
+                        log.info("Retired %d bug(s) as wontfix (attempts >= %d): %s",
+                                 len(retired_this_iter), threshold,
+                                 retired_this_iter)
+                    log.info("After fix+regression-sweep: %d bugs still open, %d retired",
+                             len(survivors), len(retired_this_iter))
+                    open_bugs = [b.to_dict() for b in survivors]
                 else:
                     open_bugs = []
 
+            done_fixes = sum(1 for r in qa_fix_results if r.status == "done")
             history.append({
                 "iteration": it,
                 "plan_rationale": plan.rationale,
                 "results": [r.to_dict() for r in results],
                 "qa": qa_report.to_dict() if qa_report else None,
                 "qa_fix_results": [r.to_dict() for r in qa_fix_results],
+                "retired_this_iter": retired_this_iter,
             })
 
-            if done == 0 and not qa_fix_results:
-                log.info("No tasks succeeded this iteration — stopping.")
+            # End-of-iter change digest — what tasks ran, what files moved,
+            # what bugs got found/fixed/retired. Useful for the user to scan
+            # a long run without spelunking through JSON dumps.
+            self._emit_iter_changes_md(
+                it, plan=plan, results=results, qa_report=qa_report,
+                qa_fix_results=qa_fix_results,
+                retired_this_iter=retired_this_iter,
+            )
+
+            # Convergence: stop iterating when NEITHER side made forward
+            # progress. Previous check only looked at "no fix tasks ran",
+            # which kept burning iters when fixes ran but all failed.
+            if done == 0 and done_fixes == 0:
+                log.info("Converged: iter %d had 0 feature wins and 0 fix wins.",
+                         it)
                 break
 
         summary = {
@@ -243,14 +297,19 @@ class Orchestrator:
             "iterations": history,
             "open_bugs": open_bugs,
             "run_dir": str(self.run_dir),
+            "usage": self.router.usage.summary(),
         }
         self._dump("summary.json", summary)
         log.info("d2p run complete. Artifacts in %s", self.run_dir)
+        log.info("Usage: %d calls, $%.4f total, cache_hit=%s",
+                 summary["usage"]["total_calls"],
+                 summary["usage"]["total_cost_usd"],
+                 summary["usage"]["cache_hit_ratio"])
         return summary
 
     # ---------------------------------------------------------------- internal
 
-    def _run_qa(self, analysis) -> tuple[Any, list[Task]]:
+    def _run_qa(self, analysis, *, iteration: int) -> tuple[Any, list[Task]]:
         listing = [p for p in self.sandbox.listing(max_entries=200)
                    if not p.startswith("...")]
         # build the same context the Planner gets, so QA targets the right files
@@ -263,6 +322,105 @@ class Orchestrator:
             audience=analysis.audience,
             key_files_block=key_files_block,
             symbol_map=symbol_map,
+            iteration=iteration,
+        )
+
+    def _emit_iter_changes_md(self, it: int, *,
+                              plan, results: list[ExecutionResult],
+                              qa_report, qa_fix_results: list[ExecutionResult],
+                              retired_this_iter: list[str]) -> None:
+        """Write iter{N}_changes.md — a human-readable digest of what moved
+        this iteration. Far easier to skim than the JSON dumps when reviewing
+        a multi-iter run."""
+        lines: list[str] = []
+        lines.append(f"# Iteration {it} — changes")
+        lines.append("")
+        lines.append(f"Rationale: {plan.rationale or '(none)'}")
+        lines.append("")
+
+        # Feature tasks
+        done = [r for r in results if r.status == "done"]
+        failed = [r for r in results if r.status != "done"]
+        lines.append(f"## Feature tasks ({len(done)}/{len(results)} succeeded)")
+        title_by_id = {t.id: t.title for t in plan.tasks}
+        if results:
+            for r in results:
+                mark = "OK" if r.status == "done" else "X "
+                title = title_by_id.get(r.task_id, r.task_id)
+                files = ", ".join(r.files_changed) or "(no files)"
+                line = f"- [{mark}] {title} — files: {files}"
+                if r.status != "done" and r.error:
+                    line += f"\n      error: {r.error[:160]}"
+                lines.append(line)
+        else:
+            lines.append("- (none)")
+        lines.append("")
+
+        # QA fixes
+        if qa_report is not None:
+            fix_done = [r for r in qa_fix_results if r.status == "done"]
+            lines.append(
+                f"## QA fixes ({len(fix_done)}/{len(qa_fix_results)} succeeded)"
+            )
+            if qa_fix_results:
+                for r in qa_fix_results:
+                    mark = "OK" if r.status == "done" else "X "
+                    files = ", ".join(r.files_changed) or "(no files)"
+                    line = f"- [{mark}] {r.task_id} — files: {files}"
+                    if r.status != "done" and r.error:
+                        line += f"\n      error: {r.error[:160]}"
+                    lines.append(line)
+            else:
+                lines.append("- (no fix tasks dispatched)")
+            lines.append("")
+
+            # Bug summary
+            lines.append("## Bugs")
+            lines.append(f"- new this iter: {len(qa_report.new_bugs)}")
+            lines.append(f"- fixed this iter: {len(qa_report.fixed_bugs)}")
+            lines.append(f"- still open: {len(qa_report.open_bugs)}")
+            lines.append(f"- retired (wontfix) this iter: {len(retired_this_iter)}")
+            if retired_this_iter:
+                for tp in retired_this_iter:
+                    lines.append(f"    - {tp}")
+            lines.append("")
+            if qa_report.new_bugs:
+                lines.append("### New bugs")
+                for b in qa_report.new_bugs:
+                    lines.append(f"- {b.test_path}: {b.title}")
+                lines.append("")
+            if qa_report.fixed_bugs:
+                lines.append("### Fixed bugs")
+                for b in qa_report.fixed_bugs:
+                    lines.append(f"- {b.test_path}: {b.title}")
+                lines.append("")
+
+        # File-level digest (collapse files_changed across all results)
+        all_files: dict[str, list[str]] = {}
+        for r in results + qa_fix_results:
+            if r.status != "done":
+                continue
+            for f in r.files_changed:
+                all_files.setdefault(f, []).append(r.task_id)
+        if all_files:
+            lines.append("## Files touched")
+            for f, tids in sorted(all_files.items()):
+                lines.append(f"- `{f}` ({len(tids)} task: {', '.join(tids)})")
+            lines.append("")
+
+        # Per-iter usage delta — useful for spotting cost spikes
+        try:
+            usage = self.router.usage.summary()
+            lines.append("## Cumulative usage")
+            lines.append(f"- total calls: {usage['total_calls']}")
+            lines.append(f"- total cost: ${usage['total_cost_usd']:.4f}")
+            lines.append(f"- cache hit ratio: {usage['cache_hit_ratio']}")
+            lines.append("")
+        except Exception:
+            pass
+
+        (self.run_dir / f"iter{it}_changes.md").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
         )
 
     def _rerun_qa_tests(self, bugs) -> dict[str, dict[str, Any]]:
@@ -302,7 +460,8 @@ class Orchestrator:
         return _check
 
     def _run_tasks_parallel(self, tasks: list[Task], *,
-                            post_check_for=None) -> list[ExecutionResult]:
+                            post_check_for=None,
+                            role: str = "executor") -> list[ExecutionResult]:
         """Run feature/fix tasks in parallel.
 
         Performance design (the 2026-05-18 rewrite):
@@ -314,7 +473,8 @@ class Orchestrator:
         - Default parallel_executors bumped to 4.
         """
         max_workers = max(1, min(self.cfg.parallel_executors, len(tasks)))
-        executor_llm = self.router.for_role("executor")
+        executor_llm = self.router.for_role(role)
+        log.info("Task batch (role=%s) using %s", role, executor_llm.name)
         executors = [Executor(executor_llm, self.sandbox)
                      for _ in range(max_workers)]
         locks: dict[str, threading.Lock] = defaultdict(threading.Lock)

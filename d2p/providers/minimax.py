@@ -12,6 +12,7 @@ from typing import Any
 import anthropic
 
 from ._json import extract_json
+from .base import UsageAccumulator
 
 log = logging.getLogger("d2p.providers.minimax")
 
@@ -19,12 +20,14 @@ log = logging.getLogger("d2p.providers.minimax")
 class MiniMaxProvider:
     def __init__(self, *, api_key: str, model: str,
                  base_url: str = "https://api.minimaxi.com/anthropic",
-                 timeout: int = 240, role: str = "default") -> None:
+                 timeout: int = 240, role: str = "default",
+                 usage: UsageAccumulator | None = None) -> None:
         if not api_key:
             raise RuntimeError("MiniMax API key is empty")
         self.role = role
         self.model = model
         self.name = f"minimax:{model}@{role}"
+        self.usage = usage
         self._client = anthropic.Anthropic(
             api_key=api_key, base_url=base_url, timeout=timeout,
         )
@@ -42,11 +45,29 @@ class MiniMaxProvider:
             messages=[{"role": "user", "content": user}],
             max_tokens=max_tokens, temperature=temperature,
         )
+        self._record_usage(resp)
         parts = []
         for block in resp.content or []:
             if getattr(block, "type", None) == "text":
                 parts.append(block.text)
         return "".join(parts).strip()
+
+    def _record_usage(self, resp: Any) -> None:
+        if self.usage is None:
+            return
+        u = getattr(resp, "usage", None)
+        if u is None:
+            return
+        try:
+            self.usage.add(
+                role=self.role, model=self.model,
+                input_tokens=getattr(u, "input_tokens", 0) or 0,
+                output_tokens=getattr(u, "output_tokens", 0) or 0,
+                cache_creation_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
+                cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
+            )
+        except Exception as e:
+            log.debug("usage record failed (%s): %s", self.name, e)
 
     def chat_json(self, system: str, user: str, *,
                   web_search: bool = False, temperature: float = 0.3,

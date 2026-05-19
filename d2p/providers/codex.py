@@ -15,6 +15,7 @@ import logging
 from typing import Any
 
 from ._json import extract_json
+from .base import UsageAccumulator
 
 log = logging.getLogger("d2p.providers.codex")
 
@@ -24,7 +25,8 @@ class CodexProvider:
 
     def __init__(self, *, api_key: str, model: str,
                  base_url: str | None = None,
-                 timeout: int = 240, role: str = "default") -> None:
+                 timeout: int = 240, role: str = "default",
+                 usage: UsageAccumulator | None = None) -> None:
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is empty")
         try:
@@ -36,6 +38,7 @@ class CodexProvider:
         self.role = role
         self.model = model
         self.name = f"codex:{model}@{role}"
+        self.usage = usage
         kwargs: dict[str, Any] = {"api_key": api_key, "timeout": timeout}
         if base_url:
             kwargs["base_url"] = base_url
@@ -59,8 +62,30 @@ class CodexProvider:
         if json_mode and not web_search:
             kwargs["response_format"] = {"type": "json_object"}
         resp = self._client.chat.completions.create(**kwargs)
+        self._record_usage(resp)
         msg = resp.choices[0].message
         return (msg.content or "").strip()
+
+    def _record_usage(self, resp: Any) -> None:
+        if self.usage is None:
+            return
+        u = getattr(resp, "usage", None)
+        if u is None:
+            return
+        try:
+            # OpenAI exposes prompt_tokens_details.cached_tokens for cache hits
+            cached = 0
+            details = getattr(u, "prompt_tokens_details", None)
+            if details is not None:
+                cached = getattr(details, "cached_tokens", 0) or 0
+            self.usage.add(
+                role=self.role, model=self.model,
+                input_tokens=getattr(u, "prompt_tokens", 0) or 0,
+                output_tokens=getattr(u, "completion_tokens", 0) or 0,
+                cache_read_tokens=cached,
+            )
+        except Exception as e:
+            log.debug("usage record failed (%s): %s", self.name, e)
 
     def chat_json(self, system: str, user: str, *,
                   web_search: bool = False, temperature: float = 0.3,

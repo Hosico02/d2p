@@ -60,8 +60,18 @@ class TestProviderFactory(unittest.TestCase):
             default_model="MiniMax-test", role_models={},
         )
         r = build_router(spec)
-        # MiniMax: same provider for every role
-        self.assertIs(r.for_role("executor"), r.for_role("planner"))
+        # MiniMax: same MODEL for every role, but a separate provider instance
+        # per role so usage records carry the right role label (each provider
+        # is constructed with role=<that role>, and its `chat()` records that
+        # role into the shared UsageAccumulator).
+        exec_p = r.for_role("executor")
+        plan_p = r.for_role("planner")
+        self.assertEqual(exec_p.model, plan_p.model)
+        self.assertEqual(exec_p.role, "executor")
+        self.assertEqual(plan_p.role, "planner")
+        # All providers share the same UsageAccumulator instance.
+        self.assertIs(exec_p.usage, plan_p.usage)
+        self.assertIs(exec_p.usage, r.usage)
 
     def test_build_router_claude_role_split(self) -> None:
         spec = ProviderSpec(

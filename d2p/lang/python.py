@@ -3,12 +3,64 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import shutil
 import subprocess
 import sys
 from typing import List
 
 from ..fs import Sandbox
+
+
+def _pick_python_310plus() -> str | None:
+    """Find the newest Python (>=3.10) on this machine.
+
+    Demos increasingly use PEP-604 unions (`int | None`) which 3.9 can't
+    even import. If we fall back to /usr/bin/python3 (3.9 on most macOS),
+    our health probe never sees a healthy baseline and rollback never fires.
+    Prefer 3.10+ explicitly, scanning common install locations.
+    """
+    candidates: list[str] = []
+    # CONDA envs
+    home = os.path.expanduser("~")
+    for env_dir in (
+        os.path.join(home, "anaconda3", "envs"),
+        os.path.join(home, "miniconda3", "envs"),
+        os.path.join(home, "miniforge3", "envs"),
+    ):
+        if os.path.isdir(env_dir):
+            for name in os.listdir(env_dir):
+                p = os.path.join(env_dir, name, "bin", "python")
+                if os.path.isfile(p):
+                    candidates.append(p)
+    # Homebrew + system pythonX.Y
+    for p in (
+        "/opt/homebrew/bin/python3.13",
+        "/opt/homebrew/bin/python3.12",
+        "/opt/homebrew/bin/python3.11",
+        "/usr/local/bin/python3.13",
+        "/usr/local/bin/python3.12",
+        "/usr/local/bin/python3.11",
+        shutil.which("python3.13"),
+        shutil.which("python3.12"),
+        shutil.which("python3.11"),
+        shutil.which("python3.10"),
+    ):
+        if p and os.path.isfile(p):
+            candidates.append(p)
+    # version probe (>=3.10)
+    for c in dict.fromkeys(candidates):
+        try:
+            r = subprocess.run(
+                [c, "-c",
+                 "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)"],
+                capture_output=True, timeout=3,
+            )
+            if r.returncode == 0:
+                return c
+        except Exception:
+            continue
+    return None
 
 
 class PythonAdapter:
@@ -18,7 +70,7 @@ class PythonAdapter:
     TIMEOUT_S = 8
 
     def __init__(self, python: str | None = None) -> None:
-        self.python = python or shutil.which("python3") or sys.executable
+        self.python = python or _pick_python_310plus() or shutil.which("python3") or sys.executable
 
     # ---- health ----
 
