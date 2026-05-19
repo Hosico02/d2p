@@ -1084,5 +1084,60 @@ class TestFixCap(unittest.TestCase):
             self.assertEqual(_attempts_of(t), 0)
 
 
+class TestBumpAttemptsScope(unittest.TestCase):
+    """The bump_attempts call must only fire for bugs the orchestrator
+    actually dispatched as fix tasks this iteration. Bugs deferred by
+    the max_concurrent_fixes cap (or otherwise absent) must NOT have
+    their attempts bumped — otherwise the wontfix threshold would trip
+    on bugs we never tried to fix."""
+
+    def test_dispatched_set_excludes_deferred(self) -> None:
+        from d2p.models import Task
+        # Three QA-fix tasks, one was dropped by the fix cap.
+        all_tasks = [
+            Task(id="qa-aaaa", title="a", rationale="", target_files=["x.py"],
+                 instructions="", priority=1, category="bugfix",
+                 forbidden_files=["tests/d2p_qa/test_a.py"]),
+            Task(id="qa-bbbb", title="b", rationale="", target_files=["x.py"],
+                 instructions="", priority=1, category="bugfix",
+                 forbidden_files=["tests/d2p_qa/test_b.py"]),
+            Task(id="qa-cccc", title="c", rationale="", target_files=["x.py"],
+                 instructions="", priority=1, category="bugfix",
+                 forbidden_files=["tests/d2p_qa/test_c.py"]),
+        ]
+        # Simulate the fix cap dropping the last one
+        dispatched = all_tasks[:2]
+        # Reconstruct bug_test_paths the way the orchestrator does
+        bug_test_paths = {
+            t.id: t.forbidden_files[0]
+            for t in dispatched
+            if t.id.startswith("qa-") and t.forbidden_files
+        }
+        dispatched_test_paths = set(bug_test_paths.values())
+        # the deferred bug's test path must NOT be in the set
+        self.assertNotIn("tests/d2p_qa/test_c.py", dispatched_test_paths)
+        self.assertIn("tests/d2p_qa/test_a.py", dispatched_test_paths)
+        self.assertIn("tests/d2p_qa/test_b.py", dispatched_test_paths)
+
+    def test_restore_tasks_dont_populate_bug_paths(self) -> None:
+        """restore-symbol tasks must NOT show up in bug_test_paths — their
+        forbidden_files is empty and their id has the "restore-" prefix."""
+        from d2p.models import Task
+        tasks = [
+            Task(id="restore-xxx", title="r", rationale="", target_files=["m.py"],
+                 instructions="", priority=0, category="bugfix",
+                 forbidden_files=[]),
+            Task(id="qa-yyyy", title="y", rationale="", target_files=["m.py"],
+                 instructions="", priority=1, category="bugfix",
+                 forbidden_files=["tests/d2p_qa/test_y.py"]),
+        ]
+        bug_test_paths = {
+            t.id: t.forbidden_files[0]
+            for t in tasks
+            if t.id.startswith("qa-") and t.forbidden_files
+        }
+        self.assertEqual(set(bug_test_paths.keys()), {"qa-yyyy"})
+
+
 if __name__ == "__main__":
     unittest.main()

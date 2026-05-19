@@ -272,11 +272,16 @@ class Orchestrator:
                     for t in fix_tasks:
                         task_snapshots[t.id] = self.sandbox.snapshot(t.target_files)
 
-                    # 3) map task -> bug.test_path so post_check knows what to run
+                    # 3) map task -> bug.test_path so post_check knows what
+                    # to run. Pull the test_path directly from each task's
+                    # forbidden_files (set by QAAgent._bug_to_task) — robust
+                    # against fix-cap re-ordering, restore_tasks interleaving,
+                    # and any future task reshuffling. Restore tasks have
+                    # empty forbidden_files so they're correctly absent here.
                     bug_test_paths: dict[str, str] = {}
-                    for t, b in zip(fix_tasks,
-                                    qa_report.new_bugs + qa_report.open_bugs):
-                        bug_test_paths[t.id] = b.test_path
+                    for t in fix_tasks:
+                        if t.id.startswith("qa-") and t.forbidden_files:
+                            bug_test_paths[t.id] = t.forbidden_files[0]
 
                     def _pc_for(t):
                         path = bug_test_paths.get(t.id)
@@ -319,10 +324,26 @@ class Orchestrator:
                     # accidentally turns green), but no more fix tasks are
                     # generated for it — frees the next iters to work on
                     # features and bugs that haven't burned the budget yet.
+                    #
+                    # IMPORTANT: only bump `attempts` for bugs that were
+                    # actually DISPATCHED as fix tasks this iter. Bugs
+                    # deferred by max_concurrent_fixes (or absent for any
+                    # other reason) shouldn't count — otherwise the wontfix
+                    # threshold trips on bugs we never actually tried to fix.
+                    dispatched_test_paths = set(bug_test_paths.values())
                     threshold = self.cfg.qa_wontfix_after_attempts
                     survivors: list = []
                     for b in still_open:
-                        n = self.qa.bump_attempts(b.test_path)
+                        if b.test_path in dispatched_test_paths:
+                            n = self.qa.bump_attempts(b.test_path)
+                        else:
+                            # deferred: keep prior attempts unchanged. Read
+                            # the current value so the threshold check below
+                            # still works if attempts are already past it
+                            # from earlier iters.
+                            n = int(self.qa._load_meta()
+                                       .get(b.test_path, {})
+                                       .get("attempts", 0) or 0)
                         if threshold and n >= threshold:
                             self.qa.mark_wontfix(b.test_path)
                             retired_this_iter.append(b.test_path)
