@@ -23,6 +23,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-concurrent-fixes", type=int, default=0,
                    help="cap fix tasks per iter (0=no cap). Lowest-attempt "
                         "bugs go first; the rest roll to next iter.")
+    p.add_argument("--fix-race", action="store_true",
+                   help="for fix tasks with a fallback model, race primary "
+                        "+ fallback prepare() in parallel. Skips the ~80s "
+                        "sequential escalation wait when primary fails. "
+                        "Costs 2× fix LLM tokens per task.")
     p.add_argument("--no-cache-analysis", action="store_true",
                    help="force a fresh Analyzer run, ignoring "
                         ".d2p/analysis_cache.json")
@@ -44,6 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg.reanalyze_every = args.reanalyze_every
     cfg.qa_wontfix_after_attempts = args.qa_wontfix_after
     cfg.max_concurrent_fixes = args.max_concurrent_fixes
+    cfg.fix_race = args.fix_race
     orch = Orchestrator(args.target, cfg=cfg, max_iterations=args.iter,
                         parallel=args.parallel, enable_qa=not args.no_qa,
                         use_analyzer_cache=not args.no_cache_analysis,

@@ -70,6 +70,42 @@ class ClaudeProvider:
                     parts.append(txt)
         return "".join(parts).strip()
 
+    def chat_structured(self, system: str, user: str, *,
+                        schema: dict[str, Any], temperature: float = 0.3,
+                        max_tokens: int = 4096) -> Any:
+        """Force the model to return a JSON object matching `schema`.
+
+        Implementation: define a single tool whose `input_schema` IS the
+        schema, then pin `tool_choice` to that tool. The model can't reply
+        with prose — it MUST invoke the tool. We return the tool's input
+        dict, which is guaranteed to conform.
+
+        Faster than chat_json because the model doesn't burn tokens on
+        deciding how to format the output, and ~always parses cleanly.
+        """
+        tool: Any = {
+            "name": "emit_result",
+            "description": "Return the result in the required structure.",
+            "input_schema": schema,
+        }
+        tool_choice: Any = {"type": "tool", "name": "emit_result"}
+        resp = self._client.messages.create(
+            model=self.model, system=system,
+            messages=[{"role": "user", "content": user}],
+            max_tokens=max_tokens, temperature=temperature,
+            tools=[tool],
+            tool_choice=tool_choice,
+        )
+        self._record_usage(resp)
+        for block in resp.content or []:
+            if getattr(block, "type", None) == "tool_use":
+                inp = getattr(block, "input", None)
+                if inp is not None:
+                    return inp
+        raise RuntimeError(
+            "Claude chat_structured: no tool_use block in response"
+        )
+
     def _record_usage(self, resp: Any) -> None:
         if self.usage is None:
             return

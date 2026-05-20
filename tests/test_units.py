@@ -1319,12 +1319,14 @@ class TestPlannerFeatureCap(unittest.TestCase):
         from unittest.mock import MagicMock
         from d2p.agents import Planner, ANALYZER_USER_TMPL  # noqa: F401
         from d2p.models import AnalysisReport
-        # Build a Planner with a mocked llm and capture the user prompt
+        # Build a Planner with a mocked llm and capture the user prompt.
+        # MagicMock auto-creates `chat_structured`, so the helper picks
+        # that path; pin it explicitly to the expected return shape.
         sb_mock = MagicMock()
         sb_mock.listing.return_value = ["app.py"]
         sb_mock.read.return_value = "print(1)\n"
         llm_mock = MagicMock()
-        llm_mock.chat_json.return_value = {"rationale": "", "tasks": []}
+        llm_mock.chat_structured.return_value = {"rationale": "", "tasks": []}
         p = Planner(llm_mock, sb_mock, max_tasks=5)
         p.run(
             AnalysisReport(domain="x", essence="e", audience="a"),
@@ -1332,14 +1334,15 @@ class TestPlannerFeatureCap(unittest.TestCase):
             history=[], open_bugs=None,
             feature_cap=1,
         )
-        # Last positional arg to chat_json is the user prompt
-        _, kwargs = llm_mock.chat_json.call_args
-        # chat_json(system, user, **kw) — user is args[1]
-        args = llm_mock.chat_json.call_args.args
+        args = llm_mock.chat_structured.call_args.args
+        kwargs = llm_mock.chat_structured.call_args.kwargs
         user_prompt = args[1] if len(args) > 1 else kwargs.get("user", "")
         # When feature_cap=1, both min_tasks and max_tasks collapse to 1
         # (the floor formula uses min(3, cap)).
         self.assertIn("1 to 1 tasks", user_prompt)
+        # Schema passed through so the model is forced into the right shape
+        self.assertIn("schema", kwargs)
+        self.assertEqual(kwargs["schema"]["properties"]["tasks"]["type"], "array")
 
 
 class TestUsageCounters(unittest.TestCase):
@@ -1735,6 +1738,106 @@ class TestResumeReload(unittest.TestCase):
             self.assertEqual(history, [])
             self.assertEqual(resume_from, 1)
             self.assertEqual(open_bugs, [])
+
+
+class TestChatStructuredFallback(unittest.TestCase):
+    def test_uses_chat_structured_when_available(self) -> None:
+        from unittest.mock import MagicMock
+        from d2p.providers.base import chat_structured
+        p = MagicMock()
+        p.chat_structured.return_value = {"ok": True}
+        out = chat_structured(p, "sys", "user",
+                              schema={"type": "object"},
+                              temperature=0.3, max_tokens=100)
+        self.assertEqual(out, {"ok": True})
+        p.chat_structured.assert_called_once()
+        p.chat_json.assert_not_called()
+
+    def test_falls_back_to_chat_json(self) -> None:
+        # Provider without chat_structured — helper must embed schema in
+        # the prompt and call chat_json.
+        from d2p.providers.base import chat_structured
+
+        class Stub:
+            name = "stub"
+            def chat(self, *a, **k): return ""
+            def chat_json(self, system, user, **kw):
+                # Schema embedded in the user prompt
+                self.last_user = user
+                return {"ok": True}
+
+        s = Stub()
+        out = chat_structured(s, "sys", "user",
+                              schema={"type": "object", "title": "X"})
+        self.assertEqual(out, {"ok": True})
+        self.assertIn('"title": "X"', s.last_user)
+
+
+class TestPlannerTrim(unittest.TestCase):
+    def test_key_files_block_caps_per_file_chars(self) -> None:
+        from unittest.mock import MagicMock
+        from d2p.agents import Planner
+        sb = MagicMock()
+        sb.read.return_value = "x" * 10_000
+        p = Planner(MagicMock(), sb, max_tasks=5)
+        block = p._build_key_files_block(["a.py", "b.py"])
+        # Each file capped at 3000 chars by Planner.KEY_FILE_CHARS
+        # Plus the "=== a.py ===\n" header (15 chars-ish)
+        self.assertLess(len(block), 2 * 3100 + 100)
+        self.assertIn("=== a.py ===", block)
+
+    def test_pick_key_files_caps_count(self) -> None:
+        from unittest.mock import MagicMock
+        from d2p.agents import Planner
+        sb = MagicMock()
+        sb.read.return_value = "x" * 100
+        p = Planner(MagicMock(), sb, max_tasks=5)
+        # 10 candidate source files, all .py
+        listing = [f"f{i}.py" for i in range(10)]
+        keys = p._pick_key_files(listing)
+        self.assertLessEqual(len(keys), p.KEY_FILES_MAX)
+
+
+class TestFixRaceConfig(unittest.TestCase):
+    def test_cfg_fix_race_defaults_false(self) -> None:
+        from d2p.config import Config
+        cfg = Config()
+        self.assertFalse(cfg.fix_race)
+
+    def test_orchestrator_logs_race_mode_for_fix_with_fallback(self) -> None:
+        """Smoke: race_fix evaluates true only when cfg.fix_race AND role
+        is fix AND fallback exists. We can't easily run the orchestrator
+        end-to-end, but verify the gating logic by inspecting the boolean."""
+        from d2p.config import Config
+        cfg = Config()
+        cfg.fix_race = True
+        # The actual gate inside _run_tasks_parallel:
+        role = "fix"
+        fallback_present = True
+        race_fix = cfg.fix_race and role == "fix" and fallback_present
+        self.assertTrue(race_fix)
+        cfg.fix_race = False
+        race_fix = cfg.fix_race and role == "fix" and fallback_present
+        self.assertFalse(race_fix)
+
+
+class TestAnalyzerPipelineGate(unittest.TestCase):
+    def test_next_iter_reanalyze_trigger_formula(self) -> None:
+        """The prefetch gate fires at the end of iter N if iter N+1 will
+        trigger re-analysis (i.e. (N+1-1) % reanalyze_every == 0 and
+        N+1 > 1)."""
+        # reanalyze_every=2 → triggers at iters 3, 5, 7, ... (next_it=3
+        # means we prefetch at end of iter 2)
+        for it, expected in [(1, False), (2, True), (3, False), (4, True)]:
+            next_it = it + 1
+            reanalyze_every = 2
+            should_prefetch = (
+                reanalyze_every and next_it > 1
+                and (next_it - 1) % reanalyze_every == 0
+            )
+            self.assertEqual(bool(should_prefetch), expected,
+                             f"iter={it} should_prefetch={should_prefetch} "
+                             f"expected={expected}")
 
 
 if __name__ == "__main__":

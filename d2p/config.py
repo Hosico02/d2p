@@ -47,6 +47,14 @@ class Config:
     # the lowest attempts (i.e. freshest to try, not the ones already
     # circling the drain).
     max_concurrent_fixes: int = 0
+    # When True AND a fallback model is configured for the fix role, the
+    # orchestrator runs primary.prepare() and fallback.prepare() in
+    # PARALLEL on every fix task. If the primary commit fails, the
+    # fallback's prepared LLM output is already available — skip the
+    # sequential ~80s escalation wait. Costs 2× fix LLM calls per task
+    # even when primary succeeds; only worth turning on when haiku fix
+    # success rate is < 70% on the target codebase.
+    fix_race: bool = False
 
     def require_key(self) -> None:
         if not self.api_key:

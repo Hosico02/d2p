@@ -136,6 +136,35 @@ class LLMProvider(Protocol):
                   max_tokens: int = 4096, retries: int = 2) -> Any: ...
 
 
+def chat_structured(provider: LLMProvider, system: str, user: str,
+                    *, schema: dict[str, Any], temperature: float = 0.3,
+                    max_tokens: int = 4096) -> Any:
+    """Coerce a JSON-shaped response that conforms to `schema`.
+
+    Calls the provider's bespoke structured-output API when available
+    (faster + more reliable: the model is forced into the shape instead
+    of reasoning about the format). Falls back to chat_json with the
+    schema embedded in the prompt otherwise.
+
+    `schema` is JSON Schema. Top-level should usually be an object with
+    a `properties` map.
+    """
+    # Provider-specific fast path
+    fast = getattr(provider, "chat_structured", None)
+    if callable(fast):
+        return fast(system, user, schema=schema,
+                    temperature=temperature, max_tokens=max_tokens)
+    # Generic fallback: append the schema to the user prompt as a hint.
+    import json as _j
+    augmented = (
+        user + "\n\nReturn STRICT JSON conforming to this schema "
+        "(no extra keys, no markdown fences):\n"
+        + _j.dumps(schema, ensure_ascii=False, indent=2)
+    )
+    return provider.chat_json(system, augmented,
+                              temperature=temperature, max_tokens=max_tokens)
+
+
 class RoleRouter:
     """Pre-builds one LLMProvider instance per role and serves them by role name.
 

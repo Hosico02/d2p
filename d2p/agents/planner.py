@@ -15,9 +15,48 @@ import uuid
 from typing import Any
 
 from ..fs import Sandbox
-from ..providers.base import LLMProvider
+from ..providers.base import LLMProvider, chat_structured
 from ..models import AnalysisReport, PlanResult, Task
 from ..symbols import build_symbol_map
+
+
+# JSON Schema for the Planner's output. When the provider supports
+# structured output (claude API tool-use, OpenAI response_format), the
+# model is forced into this shape — no format-thinking overhead, no
+# JSON-parse failures. claude-cli and minimax fall back to embedding the
+# schema in the prompt.
+PLAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["rationale", "tasks"],
+    "properties": {
+        "rationale": {
+            "type": "string",
+            "description": "2-3 sentences on why these tasks now.",
+        },
+        "tasks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["title", "instructions", "target_files",
+                             "priority", "category"],
+                "properties": {
+                    "title": {"type": "string"},
+                    "rationale": {"type": "string"},
+                    "target_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "instructions": {"type": "string"},
+                    "priority": {"type": "integer", "minimum": 1, "maximum": 9},
+                    "category": {
+                        "type": "string",
+                        "enum": ["feature", "bugfix", "ux", "docs", "infra"],
+                    },
+                },
+            },
+        },
+    },
+}
 
 log = logging.getLogger("d2p.agents.planner")
 
@@ -153,6 +192,14 @@ class Planner:
         self.sandbox = sandbox
         self.max_tasks = max_tasks
 
+    # Tighter key-files block: 5 files × 3000 chars (was 8 × 5000). The
+    # original was ~40 KB of prompt input per Planner call; the model
+    # pays cache-creation tokens on it every time the codebase shifts.
+    # The 15 KB target keeps the most load-bearing context and trims
+    # the long tail that rarely changes the plan.
+    KEY_FILES_MAX = 5
+    KEY_FILE_CHARS = 3000
+
     def _pick_key_files(self, listing: list[str]) -> list[str]:
         seen: list[str] = []
         # explicit candidates first
@@ -170,10 +217,10 @@ class Planner:
                 continue
             sizes.append((sz, p))
         sizes.sort(reverse=True)
-        for _, p in sizes[:4]:
+        for _, p in sizes[:3]:
             if p not in seen:
                 seen.append(p)
-        return seen[:8]
+        return seen[: self.KEY_FILES_MAX]
 
     def _build_key_files_block(self, key_files: list[str]) -> str:
         chunks = []
@@ -181,7 +228,7 @@ class Planner:
             txt = self.sandbox.read(p)
             if not txt:
                 continue
-            chunks.append(f"=== {p} ===\n{txt[:5000]}")
+            chunks.append(f"=== {p} ===\n{txt[: self.KEY_FILE_CHARS]}")
         return "\n\n".join(chunks) or "(none)"
 
     def run(self, analysis: AnalysisReport, *, iteration: int, max_iter: int,
@@ -226,7 +273,13 @@ class Planner:
             min_tasks=plan_lo,
             max_tasks=cap,
         )
-        data = self.llm.chat_json(PLANNER_SYS, user, temperature=0.3, max_tokens=6000)
+        # Use chat_structured when the provider supports it (Anthropic API,
+        # OpenAI). Falls back to chat_json with the schema appended to the
+        # prompt otherwise (claude-cli, minimax) — same correctness, no
+        # speed bonus.
+        data = chat_structured(self.llm, PLANNER_SYS, user,
+                               schema=PLAN_SCHEMA,
+                               temperature=0.3, max_tokens=4000)
         tasks = []
         for t in data.get("tasks", [])[:cap]:
             tasks.append(Task(

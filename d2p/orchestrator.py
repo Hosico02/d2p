@@ -157,6 +157,12 @@ class Orchestrator:
             self.run_dir = self.sandbox.root / ".d2p" / time.strftime("run-%Y%m%d-%H%M%S")
             self.run_dir.mkdir(parents=True, exist_ok=True)
         self._resume = resume_from is not None
+        # Background thread pool for prefetching next-iter Analyzer.run()
+        # while the current iter's executor/qa/fix work runs. Saves the
+        # ~50-70s Analyzer wait when --reanalyze-every is set.
+        self._bg_pool = cf.ThreadPoolExecutor(max_workers=1,
+                                              thread_name_prefix="d2p-bg")
+        self._next_analysis_future: cf.Future | None = None
 
     # ------------------------------------------------------------------ public
 
@@ -205,12 +211,22 @@ class Orchestrator:
             # Periodic re-analysis: refresh feature list mid-run, but preserve
             # essence/audience invariants (changing them mid-run would defeat
             # the whole purpose of having them).
+            #
+            # The Analyzer.run() for THIS iter was kicked off as a background
+            # future at the END of the previous iter (see `_schedule_next_analysis`).
+            # By the time we get here, it's usually already done — we just
+            # collect the result instead of blocking another ~50-70s.
             if (self.cfg.reanalyze_every and it > 1
                     and (it - 1) % self.cfg.reanalyze_every == 0):
-                log.info("Re-running Analyzer (reanalyze_every=%d)",
+                log.info("Picking up prefetched Analyzer (reanalyze_every=%d)",
                          self.cfg.reanalyze_every)
                 try:
-                    fresh = self.analyzer.run()
+                    if self._next_analysis_future is not None:
+                        fresh = self._next_analysis_future.result()
+                        self._next_analysis_future = None
+                    else:
+                        # First trigger or prefetch missed — fall back to sync
+                        fresh = self.analyzer.run()
                     fresh.essence = analysis.essence
                     fresh.audience = analysis.audience
                     analysis = fresh
@@ -464,6 +480,19 @@ class Orchestrator:
                          it)
                 break
 
+            # If the NEXT iter will trigger a re-analysis, kick off
+            # Analyzer.run() now in the background so it overlaps with
+            # the next iter's planner/executor/qa work. The result is
+            # collected at the top of the next iter.
+            next_it = it + 1
+            if (self.cfg.reanalyze_every and next_it > 1
+                    and (next_it - 1) % self.cfg.reanalyze_every == 0
+                    and self._next_analysis_future is None):
+                log.info("Prefetching Analyzer for iter %d in background",
+                         next_it)
+                self._next_analysis_future = self._bg_pool.submit(
+                    self.analyzer.run)
+
         total_elapsed_s = round(time.monotonic() - run_started, 1)
         summary = {
             "analysis": analysis.to_dict(),
@@ -488,6 +517,9 @@ class Orchestrator:
         u = cast(dict[str, Any], summary["usage"])
         log.info("Usage: %d calls, $%.4f total, cache_hit=%s",
                  u["total_calls"], u["total_cost_usd"], u["cache_hit_ratio"])
+        # Drain any outstanding bg prefetch — its result is now useless,
+        # but the thread should exit cleanly before we return.
+        self._bg_pool.shutdown(wait=False, cancel_futures=True)
         return summary
 
     # ---------------------------------------------------------------- internal
@@ -699,6 +731,14 @@ class Orchestrator:
         if fallback_llm is not None:
             log.info("Escalation available (role=%s): fallback=%s",
                      role, fallback_llm.name)
+        # Fix-race mode: race primary + fallback prepare() in parallel so
+        # the escalation LLM call doesn't add to wall time. Only active for
+        # the fix role and only when a fallback is configured + flag set.
+        race_fix = (
+            self.cfg.fix_race and role == "fix" and fallback_llm is not None
+        )
+        if race_fix:
+            log.info("Fix race ENABLED: primary + fallback prepare() in parallel")
         locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
         results: list[ExecutionResult] = []
         results_lock = threading.Lock()
@@ -776,35 +816,98 @@ class Orchestrator:
                     res.files_changed = []
             return res, snapshot
 
+        def _commit_phase(task: Task, executor: Executor, prepared,
+                          pc) -> tuple[ExecutionResult, dict[str, Any]]:
+            """Locked write phase + post-task probes. Used by both the
+            normal path and the race path."""
+            keys = sorted(set(task.target_files)) or [f"__notarget__:{task.id}"]
+            acquired: list[threading.Lock] = []
+            snapshot: dict[str, Any] = {}
+            try:
+                for k in keys:
+                    lk = locks[k]
+                    lk.acquire()
+                    acquired.append(lk)
+                snapshot = self.sandbox.snapshot(task.target_files)
+                try:
+                    res = executor.commit(prepared, post_check=pc)
+                except Exception as e:
+                    res = ExecutionResult(task_id=task.id, status="failed",
+                                          summary="", error=f"commit: {e}")
+            finally:
+                for lk in acquired:
+                    lk.release()
+            if res.status == "done":
+                rolled = _rollback_if_health_regressed(
+                    self.sandbox, self.health,
+                    baseline=cached_health_baseline, snapshot=snapshot,
+                )
+                if not rolled and cached_test_baseline and self.qa is not None:
+                    rolled = _rollback_if_baseline_test_regressed(
+                        self.sandbox, self.qa,
+                        baseline=cached_test_baseline, snapshot=snapshot,
+                    )
+                if rolled:
+                    res.status = "failed"
+                    res.error = ((res.error + " | ") if res.error else "") + \
+                                "regression detected — rolled back"
+                    res.files_changed = []
+            return res, snapshot
+
         def _run(idx: int, task: Task) -> None:
             pc = post_check_for(task) if post_check_for else None
-            res, _snapshot = _attempt(task, executors[idx % max_workers], pc)
 
-            # Escalation: if the primary executor failed AND a fallback model
-            # is wired for this role AND the failure is the kind a stronger
-            # model could plausibly fix, retry once.
-            # The sandbox is already rolled back to the pre-task state, so the
-            # second attempt starts from the same baseline as the first.
-            if res.status != "done" and fallback_llm is not None:
-                if _should_escalate(res.error):
-                    log.info("task %s failed (%s) — escalating to %s",
-                             task.id, _flatten(res.error, 120),
-                             fallback_llm.name)
-                    fb_executor = Executor(fallback_llm, self.sandbox,
-                                           usage=self.router.usage)
-                    fb_res, _ = _attempt(task, fb_executor, pc)
+            if race_fix:
+                # Race path: kick off primary + fallback prepare() in parallel.
+                # Use a dedicated 2-thread pool so the racing prepares don't
+                # consume slots in the outer task pool.
+                assert fallback_llm is not None  # guarded by race_fix
+                fb_executor = Executor(fallback_llm, self.sandbox,
+                                       usage=self.router.usage)
+                primary_exec = executors[idx % max_workers]
+                with cf.ThreadPoolExecutor(max_workers=2,
+                                            thread_name_prefix="d2p-race") as rp:
+                    f_prim = rp.submit(primary_exec.prepare, task)
+                    f_fb = rp.submit(fb_executor.prepare, task)
+                    prep_primary = f_prim.result()
+                    prep_fallback = f_fb.result()
+                res, _ = _commit_phase(task, primary_exec, prep_primary, pc)
+                if res.status != "done" and _should_escalate(res.error):
+                    log.info("task %s primary failed (%s) — applying RACED "
+                             "fallback (%s)", task.id,
+                             _flatten(res.error, 120), fallback_llm.name)
+                    fb_res, _ = _commit_phase(task, fb_executor, prep_fallback, pc)
                     if fb_res.status == "done":
-                        fb_res.summary = (fb_res.summary or "") + " [escalated]"
+                        fb_res.summary = (fb_res.summary or "") + " [raced]"
                         res = fb_res
                     else:
-                        # keep the original error too — debug visibility for users
-                        # who want to know which model failed which way
                         res.error = ((res.error or "") +
-                                     " | escalation also failed: " +
+                                     " | raced fallback also failed: " +
                                      _flatten(fb_res.error, 120))
-                else:
-                    log.info("task %s failed structurally (%s) — skipping escalation",
-                             task.id, _flatten(res.error, 120))
+            else:
+                # Normal path: primary only; sequential escalation on failure.
+                res, _snapshot = _attempt(task, executors[idx % max_workers], pc)
+
+                if res.status != "done" and fallback_llm is not None:
+                    if _should_escalate(res.error):
+                        log.info("task %s failed (%s) — escalating to %s",
+                                 task.id, _flatten(res.error, 120),
+                                 fallback_llm.name)
+                        fb_executor = Executor(fallback_llm, self.sandbox,
+                                               usage=self.router.usage)
+                        fb_res, _ = _attempt(task, fb_executor, pc)
+                        if fb_res.status == "done":
+                            fb_res.summary = (fb_res.summary or "") + " [escalated]"
+                            res = fb_res
+                        else:
+                            # keep the original error too — debug visibility for users
+                            # who want to know which model failed which way
+                            res.error = ((res.error or "") +
+                                         " | escalation also failed: " +
+                                         _flatten(fb_res.error, 120))
+                    else:
+                        log.info("task %s failed structurally (%s) — skipping escalation",
+                                 task.id, _flatten(res.error, 120))
 
             log.info("task %s [%s] -> %s (%d files)",
                      task.id, task.title[:60], res.status, len(res.files_changed))
