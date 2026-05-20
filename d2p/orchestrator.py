@@ -679,8 +679,31 @@ class Orchestrator:
 
         def _attempt(task: Task, executor: Executor,
                      pc) -> tuple[ExecutionResult, dict[str, Any]]:
-            """One attempt: acquire locks, snapshot, write, probe, rollback.
-            Returns (result, snapshot_taken)."""
+            """One attempt with the LLM call OUTSIDE the per-file lock.
+
+            Phase 1 (unlocked): executor.prepare() reads target files and
+                runs the LLM. This is the slow part — moving it out of
+                the lock is the whole point of the prepare/commit split.
+                Two tasks targeting the same file now spend their LLM
+                budget in parallel.
+
+            Phase 2 (locked): executor.commit() writes / patches / does
+                syntax check + self-heal + post_check. Cheap, contended
+                on the actual file. FILE-mode writes refuse to clobber
+                if the file changed since prepare() read it; PATCH-mode
+                handles concurrency naturally via SEARCH/REPLACE.
+
+            Phase 3 (unlocked): health + baseline-test probes / rollback.
+            """
+            # --- Phase 1: prepare (LLM call) — no lock held ---
+            try:
+                prepared = executor.prepare(task)
+            except Exception as e:
+                res = ExecutionResult(task_id=task.id, status="failed",
+                                      summary="", error=f"prepare: {e}")
+                return res, {}
+
+            # --- Phase 2: commit (writes) under per-file lock ---
             keys = sorted(set(task.target_files)) or [f"__notarget__:{task.id}"]
             acquired: list[threading.Lock] = []
             snapshot: dict[str, Any] = {}
@@ -691,14 +714,15 @@ class Orchestrator:
                     acquired.append(lk)
                 snapshot = self.sandbox.snapshot(task.target_files)
                 try:
-                    res = executor.run(task, post_check=pc)
+                    res = executor.commit(prepared, post_check=pc)
                 except Exception as e:
                     res = ExecutionResult(task_id=task.id, status="failed",
-                                          summary="", error=str(e))
+                                          summary="", error=f"commit: {e}")
             finally:
                 for lk in acquired:
                     lk.release()
 
+            # --- Phase 3: probes / rollback (unlocked) ---
             if res.status == "done":
                 rolled = _rollback_if_health_regressed(
                     self.sandbox, self.health,

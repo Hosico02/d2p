@@ -26,10 +26,35 @@ import logging
 import re as _re
 from typing import Any, Callable, Optional, Tuple
 
+from dataclasses import dataclass, field
+
 from ..fs import Sandbox
 from ..lang import LanguageAdapter, adapter_for, detect_primary_language
 from ..llm import MiniMaxClient
 from ..models import ExecutionResult, Task
+
+
+@dataclass
+class PreparedExecution:
+    """Carries the LLM-call output across the prepare → commit boundary.
+
+    The two-phase split lets the orchestrator do the slow LLM call OUTSIDE
+    the per-file lock while keeping the actual writes serialised. Two
+    tasks targeting the same file can now both spend their LLM time in
+    parallel and only contend on the (~ms) write phase.
+
+    The `source_snapshot` records what each target file looked like AT
+    PREPARE TIME. commit() compares against the file's current state to
+    detect concurrent modifications (the cost of moving LLM out of the
+    lock). PATCH-mode handles concurrency naturally via SEARCH/REPLACE
+    against current content; FILE-mode refuses to clobber a changed file.
+    """
+    task: Task
+    parsed: dict[str, Any]              # parse_executor_output(...) result
+    status: str                          # "done" / "skipped" / "failed"
+    summary: str
+    source_snapshot: dict[str, str] = field(default_factory=dict)
+    llm_error: Optional[str] = None     # set if the LLM call itself failed
 
 log = logging.getLogger("d2p.agents.executor")
 
@@ -132,12 +157,21 @@ class Executor:
         # are a no-op.
         self.usage = usage
 
-    def run(self, task: Task, *,
-            post_check: Optional[Callable[[], Tuple[bool, str]]] = None,
-            ) -> ExecutionResult:
+    # ---- prepare/commit split -----------------------------------------------
+    # The orchestrator calls `prepare` OUTSIDE the per-file lock (slow LLM
+    # call) and `commit` INSIDE the lock (cheap writes). For one-shot
+    # callers / unit tests, `run` is the combined wrapper.
+
+    def prepare(self, task: Task) -> "PreparedExecution":
+        """Phase 1: read target files, call the LLM, parse the output.
+        No sandbox writes. Safe to call concurrently without locks because
+        sandbox.read is read-only.
+        """
         files_block_parts = []
+        source_snapshot: dict[str, str] = {}
         for rel in task.target_files[:6]:
             current = self.sandbox.read(rel)
+            source_snapshot[rel] = current
             files_block_parts.append(
                 f"=== {rel} ===\n{current if current else '(file does not exist yet)'}"
             )
@@ -153,12 +187,40 @@ class Executor:
             raw = self.llm.chat(EXECUTOR_SYS, user, temperature=0.2,
                                 max_tokens=16000)
         except Exception as e:
-            return ExecutionResult(task_id=task.id, status="failed",
-                                   summary="", error=f"executor LLM error: {e}")
+            return PreparedExecution(
+                task=task, parsed={}, status="failed", summary="",
+                source_snapshot=source_snapshot,
+                llm_error=f"executor LLM error: {e}",
+            )
 
         parsed = parse_executor_output(raw)
-        status = parsed["status"]
-        summary = parsed["summary"]
+        return PreparedExecution(
+            task=task, parsed=parsed,
+            status=parsed["status"], summary=parsed["summary"],
+            source_snapshot=source_snapshot,
+        )
+
+    def commit(self, prepared: "PreparedExecution", *,
+               post_check: Optional[Callable[[], Tuple[bool, str]]] = None,
+               ) -> ExecutionResult:
+        """Phase 2: apply writes, run syntax check, self-heal, post_check.
+        Caller MUST hold the per-file lock(s) for `prepared.task.target_files`.
+
+        Concurrent-modification handling: if a FILE-mode target's current
+        content differs from the snapshot captured at prepare time, we
+        refuse the write (it would clobber another task's parallel edit).
+        PATCH-mode targets are safe because SEARCH/REPLACE runs against
+        the CURRENT file content — either the anchors are still present
+        (apply cleanly) or they're not (we get a miss and the retry path
+        handles it)."""
+        task = prepared.task
+        if prepared.llm_error:
+            return ExecutionResult(task_id=task.id, status="failed",
+                                   summary="", error=prepared.llm_error)
+
+        status = prepared.status
+        summary = prepared.summary
+        parsed = prepared.parsed
         if status == "skipped":
             return ExecutionResult(task_id=task.id, status="skipped",
                                    summary=summary or "model skipped")
@@ -218,6 +280,20 @@ class Executor:
                 rejected.append(f"{rel}: forbidden (test file, read-only)")
                 continue
             existing = self.sandbox.read(rel)
+            # Concurrent-modification check: FILE-mode would clobber any
+            # write a parallel task made between our prepare() and commit().
+            # If the file changed since we read it during prepare, refuse —
+            # the orchestrator will surface "concurrent modification" and
+            # the user/Planner can re-run.
+            snapshot_at_prepare = prepared.source_snapshot.get(rel)
+            if (snapshot_at_prepare is not None
+                    and existing != snapshot_at_prepare):
+                rejected.append(
+                    f"{rel}: concurrent modification — file changed between "
+                    f"LLM prepare and write (FILE-mode refused; "
+                    f"consider re-running with PATCH mode)"
+                )
+                continue
             reject = _guard_destructive_write(rel, existing, content)
             if reject:
                 rejected.append(f"{rel}: {reject}")
@@ -297,6 +373,16 @@ class Executor:
                 result.summary = (result.summary + f" | retry{attempt}: " +
                                   retry_result.summary)[:240]
         return result
+
+    def run(self, task: Task, *,
+            post_check: Optional[Callable[[], Tuple[bool, str]]] = None,
+            ) -> ExecutionResult:
+        """Backward-compat wrapper: prepare + commit in one call. Useful for
+        callers that don't need lock-free parallelism (tests, one-off
+        invocations). The orchestrator calls prepare/commit separately to
+        run the LLM portion outside the per-file lock."""
+        prepared = self.prepare(task)
+        return self.commit(prepared, post_check=post_check)
 
     # ---- patch retry on SEARCH miss -----------------------------------------
 

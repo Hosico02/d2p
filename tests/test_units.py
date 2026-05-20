@@ -1447,5 +1447,175 @@ class TestStageTimingsInMd(unittest.TestCase):
             self.assertIn("fix=45.7s", md)
 
 
+class TestExecutorPrepareCommit(unittest.TestCase):
+    """The 2026-05-20 refactor split Executor.run into prepare (unlocked LLM
+    call) + commit (locked writes). Verify (a) backward-compat — run() still
+    works, (b) FILE-mode refuses to clobber a concurrently-modified file,
+    (c) PATCH-mode applies cleanly against the post-modification content."""
+
+    def _mk(self, root, llm_response):
+        from unittest.mock import MagicMock
+        from d2p.agents import Executor
+        sb = Sandbox(root)
+        llm = MagicMock()
+        llm.chat.return_value = llm_response
+        ex = Executor.__new__(Executor)
+        ex.llm = llm
+        ex.sandbox = sb
+        from d2p.lang import adapter_for, detect_primary_language
+        ex.adapter = adapter_for(detect_primary_language(sb))
+        ex.usage = None
+        return ex
+
+    def test_file_mode_refuses_concurrent_modification(self) -> None:
+        from d2p.models import Task
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "a.py").write_text("# v1\nprint(1)\n")
+            ex = self._mk(root, (
+                "STATUS: done\nSUMMARY: rewrite\n"
+                "===FILE: a.py===\n# v2\nprint(2)\n===END===\n"
+            ))
+            task = Task(id="t1", title="t", rationale="", target_files=["a.py"],
+                        instructions="", priority=1, category="feature")
+            # Phase 1: prepare reads a.py at v1
+            prepared = ex.prepare(task)
+            self.assertEqual(prepared.source_snapshot["a.py"], "# v1\nprint(1)\n")
+            # Concurrent modification: another task writes v_other before commit
+            (root / "a.py").write_text("# v_other\nprint(99)\n")
+            # Phase 2: commit must refuse to clobber v_other with v2
+            res = ex.commit(prepared)
+            self.assertEqual(res.status, "failed")
+            self.assertIn("concurrent modification", res.error)
+            # The concurrent write must be preserved
+            self.assertEqual((root / "a.py").read_text(), "# v_other\nprint(99)\n")
+
+    def test_file_mode_applies_when_unchanged(self) -> None:
+        from d2p.models import Task
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "a.py").write_text("# v1\nprint(1)\n")
+            ex = self._mk(root, (
+                "STATUS: done\nSUMMARY: rewrite\n"
+                "===FILE: a.py===\n# v2\nx = 1\ny = 2\nz = 3\nprint(x+y+z)\n===END===\n"
+            ))
+            task = Task(id="t1", title="t", rationale="", target_files=["a.py"],
+                        instructions="", priority=1, category="feature")
+            prepared = ex.prepare(task)
+            res = ex.commit(prepared)
+            self.assertEqual(res.status, "done", res.error)
+            self.assertIn("# v2", (root / "a.py").read_text())
+
+    def test_patch_mode_survives_concurrent_modification(self) -> None:
+        """PATCH-mode handles concurrency naturally because SEARCH/REPLACE
+        runs against the file's CURRENT content. If the anchor texts are
+        still present after the concurrent write, the patch applies fine."""
+        from d2p.models import Task
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            # File has two functions; we patch foo and concurrent edit modifies bar.
+            initial = (
+                "def foo():\n    return 1\n\n"
+                "def bar():\n    return 2\n"
+            )
+            (root / "lib.py").write_text(initial)
+            ex = self._mk(root, (
+                "STATUS: done\nSUMMARY: patch foo\n"
+                "===PATCH: lib.py===\n"
+                "<<<SEARCH\ndef foo():\n    return 1\nSEARCH>>>\n"
+                "<<<REPLACE\ndef foo():\n    return 42\nREPLACE>>>\n"
+                "===END===\n"
+            ))
+            task = Task(id="t2", title="t", rationale="", target_files=["lib.py"],
+                        instructions="", priority=1, category="feature")
+            prepared = ex.prepare(task)
+            # Concurrent modification: another task edits bar (NOT foo)
+            new_content = (
+                "def foo():\n    return 1\n\n"
+                "def bar():\n    return 999\n"
+            )
+            (root / "lib.py").write_text(new_content)
+            # Phase 2: PATCH should still find foo's anchor and apply
+            res = ex.commit(prepared)
+            self.assertEqual(res.status, "done", res.error)
+            final = (root / "lib.py").read_text()
+            self.assertIn("return 42", final)   # our patch applied
+            self.assertIn("return 999", final)  # concurrent edit preserved
+
+    def test_run_wrapper_calls_prepare_then_commit(self) -> None:
+        """Backward-compat: run() is equivalent to prepare + commit."""
+        from d2p.models import Task
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            ex = self._mk(root, (
+                "STATUS: done\nSUMMARY: create\n"
+                "===FILE: new.py===\nimport os\nprint(os.getcwd())\n===END===\n"
+            ))
+            task = Task(id="t3", title="t", rationale="", target_files=["new.py"],
+                        instructions="", priority=1, category="feature")
+            res = ex.run(task)
+            self.assertEqual(res.status, "done", res.error)
+            self.assertTrue((root / "new.py").is_file())
+
+
+class TestExecutorParallelLLM(unittest.TestCase):
+    """Smoke test that two prepare() calls can run concurrently — the whole
+    point of moving the LLM out of the per-file lock. Mocked LLM sleeps;
+    if prepare wasn't parallel-safe (e.g. shared mutable state) elapsed
+    time would be ~2× serial."""
+
+    def test_two_prepares_run_in_parallel(self) -> None:
+        import threading as _th
+        import time as _time
+        from unittest.mock import MagicMock
+        from d2p.agents import Executor
+        from d2p.models import Task
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "app.py").write_text("print(1)\n")
+            sb = Sandbox(root)
+
+            def slow_chat(*a, **k):
+                _time.sleep(0.5)
+                return ("STATUS: done\nSUMMARY: x\n"
+                        "===FILE: app.py===\nprint(2)\n===END===\n")
+
+            llm = MagicMock()
+            llm.chat.side_effect = slow_chat
+
+            # Two executors share the same sandbox/LLM (mock is thread-safe
+            # because each call has its own kwargs)
+            from d2p.lang import adapter_for, detect_primary_language
+            ex1 = Executor.__new__(Executor)
+            ex1.llm = llm; ex1.sandbox = sb
+            ex1.adapter = adapter_for(detect_primary_language(sb))
+            ex1.usage = None
+            ex2 = Executor.__new__(Executor)
+            ex2.llm = llm; ex2.sandbox = sb
+            ex2.adapter = adapter_for(detect_primary_language(sb))
+            ex2.usage = None
+
+            results: list = [None, None]
+
+            def w(i, ex):
+                t = Task(id=f"t{i}", title="x", rationale="",
+                         target_files=["app.py"], instructions="",
+                         priority=1, category="feature")
+                results[i] = ex.prepare(t)
+
+            t0 = _time.monotonic()
+            ths = [_th.Thread(target=w, args=(0, ex1)),
+                   _th.Thread(target=w, args=(1, ex2))]
+            for t in ths: t.start()
+            for t in ths: t.join()
+            elapsed = _time.monotonic() - t0
+            # If serialised: ~1.0s. In parallel: ~0.5s. Allow some scheduling slack.
+            self.assertLess(elapsed, 0.9,
+                            f"prepare() not running in parallel: elapsed={elapsed:.2f}s")
+            for r in results:
+                self.assertIsNotNone(r)
+
+
 if __name__ == "__main__":
     unittest.main()

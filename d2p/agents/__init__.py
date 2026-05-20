@@ -23,6 +23,7 @@ from .executor import (
     EXECUTOR_USER_TMPL,
     Executor,
     PATCH_RETRY_SYS,
+    PreparedExecution,
     parse_executor_output,
     # parser + safety-net helpers exported for unit tests
     _apply_post_check_to_result,
@@ -39,7 +40,7 @@ from .executor import (
 
 __all__ = [
     # agents
-    "Analyzer", "Planner", "Executor",
+    "Analyzer", "Planner", "Executor", "PreparedExecution",
     # prompts
     "ANALYZER_SYS", "ANALYZER_USER_TMPL",
     "PLANNER_SYS", "PLANNER_USER_TMPL",
