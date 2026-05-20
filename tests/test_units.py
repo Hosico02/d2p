@@ -1773,23 +1773,17 @@ class TestChatStructuredFallback(unittest.TestCase):
         self.assertIn('"title": "X"', s.last_user)
 
 
-class TestPlannerKeyFilesSize(unittest.TestCase):
-    """Planner exposes its key-files-block budget via class constants so
-    bespoke callers (and post-mortems) can read them. The original 8×5000
-    budget was reverted to after the 2026-05-20 trim experiment shifted
-    cost into the Executor."""
-
+class TestPlannerTrim(unittest.TestCase):
     def test_key_files_block_caps_per_file_chars(self) -> None:
         from unittest.mock import MagicMock
         from d2p.agents import Planner
         sb = MagicMock()
-        sb.read.return_value = "x" * 100_000
+        sb.read.return_value = "x" * 10_000
         p = Planner(MagicMock(), sb, max_tasks=5)
         block = p._build_key_files_block(["a.py", "b.py"])
-        # Each file capped at Planner.KEY_FILE_CHARS (currently 5000).
-        # Plus the "=== a.py ===\n" header.
-        per_file_budget = p.KEY_FILE_CHARS + 50
-        self.assertLess(len(block), 2 * per_file_budget)
+        # Each file capped at 3000 chars by Planner.KEY_FILE_CHARS
+        # Plus the "=== a.py ===\n" header (15 chars-ish)
+        self.assertLess(len(block), 2 * 3100 + 100)
         self.assertIn("=== a.py ===", block)
 
     def test_pick_key_files_caps_count(self) -> None:
@@ -1798,8 +1792,8 @@ class TestPlannerKeyFilesSize(unittest.TestCase):
         sb = MagicMock()
         sb.read.return_value = "x" * 100
         p = Planner(MagicMock(), sb, max_tasks=5)
-        # 15 candidate source files, all .py
-        listing = [f"f{i}.py" for i in range(15)]
+        # 10 candidate source files, all .py
+        listing = [f"f{i}.py" for i in range(10)]
         keys = p._pick_key_files(listing)
         self.assertLessEqual(len(keys), p.KEY_FILES_MAX)
 

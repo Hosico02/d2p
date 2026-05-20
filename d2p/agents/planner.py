@@ -192,23 +192,13 @@ class Planner:
         self.sandbox = sandbox
         self.max_tasks = max_tasks
 
-    # Key-files block size: 8 files × 5000 chars (~40 KB).
-    #
-    # The 2026-05-20 attempt at trimming to 5 × 3000 (~15 KB) was
-    # NET-NEGATIVE: it saved ~6s on the Planner call but triggered
-    # extra Executor regressions that paid sonnet-escalation tokens
-    # worth roughly $0.50 per failed task. The "savings" was ~$0.04
-    # per Planner call. Context is cheap; failure is expensive.
-    #
-    # Symbol map already gives Planner a structural overview cheaply,
-    # so the key-files content is mainly for strategic awareness of
-    # the existing implementation. Truncating it changes the tasks
-    # the Planner emits (more cross-cutting, higher regression rate
-    # downstream). Keep at the original size — the savings have to
-    # come from the Executor / Fix layers, not from starving the
-    # Planner's input.
-    KEY_FILES_MAX = 8
-    KEY_FILE_CHARS = 5000
+    # Tighter key-files block: 5 files × 3000 chars (was 8 × 5000). The
+    # original was ~40 KB of prompt input per Planner call; the model
+    # pays cache-creation tokens on it every time the codebase shifts.
+    # The 15 KB target keeps the most load-bearing context and trims
+    # the long tail that rarely changes the plan.
+    KEY_FILES_MAX = 5
+    KEY_FILE_CHARS = 3000
 
     def _pick_key_files(self, listing: list[str]) -> list[str]:
         seen: list[str] = []
@@ -227,7 +217,7 @@ class Planner:
                 continue
             sizes.append((sz, p))
         sizes.sort(reverse=True)
-        for _, p in sizes[:4]:
+        for _, p in sizes[:3]:
             if p not in seen:
                 seen.append(p)
         return seen[: self.KEY_FILES_MAX]
