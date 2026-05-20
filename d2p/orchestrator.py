@@ -154,9 +154,11 @@ class Orchestrator:
         # subsequent runs against the same demo skip the (slow + costly)
         # web-search-fueled re-analysis when nothing changed.
         cache_path = self.sandbox.root / ".d2p" / "analysis_cache.json"
+        _t0 = time.monotonic()
         analysis, hit = self.analyzer.run_cached(
             cache_path, use_cache=self.use_analyzer_cache,
         )
+        analyzer_elapsed = round(time.monotonic() - _t0, 1)
         self._dump("analysis.json", analysis.to_dict())
         log.info("Analyzer (%s): essence=%r audience=%r features=%d",
                  "cache HIT" if hit else "fresh",
@@ -206,14 +208,20 @@ class Orchestrator:
             else:
                 feature_cap = self.planner.max_tasks   # default 5
 
+            # Per-stage timings — surfaced in iter md and summary.json so
+            # users can see where each iter spent its wall-clock budget.
+            stage_t: dict[str, float] = {}
+            _t = time.monotonic()
             plan = self.planner.run(
                 analysis, iteration=it,
                 max_iter=self.cfg.max_iterations,
                 history=history, open_bugs=open_bugs,
                 feature_cap=feature_cap,
             )
+            stage_t["planner_s"] = round(time.monotonic() - _t, 1)
             self._dump(f"plan_iter{it}.json", plan.to_dict())
-            log.info("Planner produced %d tasks (cap=%d)", len(plan.tasks), feature_cap)
+            log.info("Planner produced %d tasks (cap=%d) in %.1fs",
+                     len(plan.tasks), feature_cap, stage_t["planner_s"])
             # P2: defence in depth — Planner already targets <= feature_cap,
             # but trim+resort here in case it overshot. Small/low-risk first.
             plan.tasks = sorted(plan.tasks,
@@ -221,18 +229,23 @@ class Orchestrator:
             if not plan.tasks:
                 log.info("Planner emitted no tasks — converged.")
                 break
+            _t = time.monotonic()
             results = self._run_tasks_parallel(plan.tasks)
+            stage_t["executor_s"] = round(time.monotonic() - _t, 1)
 
             self._dump(f"exec_iter{it}.json", [r.to_dict() for r in results])
             done = sum(1 for r in results if r.status == "done")
-            log.info("Iteration %d: %d/%d feature tasks done", it, done, len(results))
+            log.info("Iteration %d: %d/%d feature tasks done in %.1fs",
+                     it, done, len(results), stage_t["executor_s"])
 
             qa_report = None
             qa_fix_results: list[ExecutionResult] = []
             regressions: list[dict[str, Any]] = []
             retired_this_iter: list[str] = []
             if self.qa is not None:
+                _t = time.monotonic()
                 qa_report, fix_tasks = self._run_qa(analysis, iteration=it)
+                stage_t["qa_s"] = round(time.monotonic() - _t, 1)
                 self._dump(f"qa_iter{it}.json", qa_report.to_dict())
                 log.info("QA: new_bugs=%d open_bugs=%d fixed=%d retired=%d",
                          len(qa_report.new_bugs), len(qa_report.open_bugs),
@@ -309,14 +322,18 @@ class Orchestrator:
                         path = bug_test_paths.get(t.id)
                         return self._qa_fix_post_check(path) if path else None
 
+                    _t = time.monotonic()
                     qa_fix_results = self._run_tasks_parallel(
                         fix_tasks, post_check_for=_pc_for, role="fix")
+                    stage_t["fix_s"] = round(time.monotonic() - _t, 1)
                     self._dump(f"qa_fix_iter{it}.json",
                                [r.to_dict() for r in qa_fix_results])
 
                     # 3) re-run the WHOLE corpus to detect regressions
+                    _t = time.monotonic()
                     all_tests = self._all_corpus_tests()
                     post_runs = {p: self.qa._run_test_file(p) for p in all_tests}
+                    stage_t["regression_sweep_s"] = round(time.monotonic() - _t, 1)
                     regressions = [
                         {"test": p,
                          "output": post_runs[p]["output"][-800:]}
@@ -391,6 +408,7 @@ class Orchestrator:
             history.append({
                 "iteration": it,
                 "elapsed_s": iter_elapsed_s,
+                "stage_timings": stage_t,
                 "cost_delta_usd": iter_cost_delta,
                 "cumulative_cost_usd": cur_cost,
                 "plan_rationale": plan.rationale,
@@ -410,6 +428,7 @@ class Orchestrator:
                 still_open_count=len(open_bugs),
                 elapsed_s=iter_elapsed_s,
                 cost_delta_usd=iter_cost_delta,
+                stage_timings=stage_t,
             )
 
             # Convergence: stop iterating when NEITHER side made forward
@@ -427,6 +446,8 @@ class Orchestrator:
             "open_bugs": open_bugs,
             "run_dir": str(self.run_dir),
             "elapsed_s": total_elapsed_s,
+            "analyzer_elapsed_s": analyzer_elapsed,
+            "analyzer_cache_hit": hit,
             "usage": self.router.usage.summary(),
         }
         self._dump("summary.json", summary)
@@ -462,7 +483,8 @@ class Orchestrator:
                               retired_this_iter: list[str],
                               still_open_count: int = 0,
                               elapsed_s: float = 0.0,
-                              cost_delta_usd: float = 0.0) -> None:
+                              cost_delta_usd: float = 0.0,
+                              stage_timings: dict[str, float] | None = None) -> None:
         """Write iter{N}_changes.md — a human-readable digest of what moved
         this iteration. Far easier to skim than the JSON dumps when reviewing
         a multi-iter run."""
@@ -470,6 +492,12 @@ class Orchestrator:
         lines.append(f"# Iteration {it} — changes")
         lines.append("")
         lines.append(f"Elapsed: {elapsed_s:.1f}s  •  Cost delta: ${cost_delta_usd:.4f}")
+        if stage_timings:
+            # Render as planner=Xs, executor=Ys, qa=Zs, fix=Ws — instantly
+            # shows where the iter's time went without scrolling JSON.
+            parts = [f"{k.removesuffix('_s')}={v:.1f}s"
+                     for k, v in stage_timings.items()]
+            lines.append("Stage timings: " + ", ".join(parts))
         lines.append("")
         lines.append(f"Rationale: {plan.rationale or '(none)'}")
         lines.append("")
@@ -628,7 +656,8 @@ class Orchestrator:
         max_workers = max(1, min(self.cfg.parallel_executors, len(tasks)))
         executor_llm = self.router.for_role(role)
         log.info("Task batch (role=%s) using %s", role, executor_llm.name)
-        executors = [Executor(executor_llm, self.sandbox)
+        executors = [Executor(executor_llm, self.sandbox,
+                              usage=self.router.usage)
                      for _ in range(max_workers)]
         fallback_llm = self.router.for_fallback(role)
         if fallback_llm is not None:
@@ -701,7 +730,8 @@ class Orchestrator:
                     log.info("task %s failed (%s) — escalating to %s",
                              task.id, _flatten(res.error, 120),
                              fallback_llm.name)
-                    fb_executor = Executor(fallback_llm, self.sandbox)
+                    fb_executor = Executor(fallback_llm, self.sandbox,
+                                           usage=self.router.usage)
                     fb_res, _ = _attempt(task, fb_executor, pc)
                     if fb_res.status == "done":
                         fb_res.summary = (fb_res.summary or "") + " [escalated]"

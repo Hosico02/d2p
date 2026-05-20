@@ -1,378 +1,38 @@
-"""Analyzer / Planner / Executor agents.
+"""Executor agent — receives ONE Task, emits ===FILE=== / ===PATCH=== blocks.
 
-Design goal: no hardcoded demo-type detectors. Each agent works off the raw
-project listing + a short readme, and lets the LLM decide what the project
-is and what features a competitor product has. Adding a new demo type
-(audio, blockchain, …) requires *no* code changes here.
+Editing modes:
+- Mode A: full file rewrite (for new or short files).
+- Mode B: SEARCH/REPLACE patches (preferred for large existing files).
+
+Pipeline:
+- parse executor output into (files, patches),
+- apply patches (with fuzzy-locate fallback, then one LLM-driven retry on
+  SEARCH miss),
+- run destructive-shrink guard on every write,
+- post-write syntax check; on syntax error invoke self-heal (one shot)
+  before giving up,
+- optional post_check callback (used by QA fix tasks) that runs the bug's
+  failing test up to MAX_FIX_ATTEMPTS times with extracted assertion
+  pinpointing.
+
+All search/replace + parser helpers live in this module; they're
+re-exported from `d2p.agents` for the unit tests.
 """
 from __future__ import annotations
 
 import ast
-import hashlib
 import json as _json
 import logging
 import re as _re
-import uuid
-from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
 
-from .fs import Sandbox
-from .lang import LanguageAdapter, NullAdapter, adapter_for, detect_primary_language
-from .llm import MiniMaxClient
-from .models import AnalysisReport, ExecutionResult, Feature, PlanResult, Task
-from .symbols import build_symbol_map
+from ..fs import Sandbox
+from ..lang import LanguageAdapter, adapter_for, detect_primary_language
+from ..llm import MiniMaxClient
+from ..models import ExecutionResult, Task
 
-log = logging.getLogger("d2p.agents")
+log = logging.getLogger("d2p.agents.executor")
 
-
-# ============ Analyzer ========================================================
-
-ANALYZER_SYS = """You are the Analyzer agent in a Demo-to-Product (d2p) pipeline.
-Your job:
-
-1. Read the demo (listing + key files) and identify TWO things separately:
-   - "domain": the problem area (e.g. "social deduction game", "speech-to-text")
-   - "essence": the demo's CORE NATURE that must be preserved across iterations.
-     The essence captures what kind of artifact this demo IS — who its real
-     audience is, and what makes it distinct from typical products in the
-     same domain.
-   - "audience": one short phrase, e.g. "LLM agents", "developers via API",
-     "research notebook users", "humans on a web UI", "CLI power-users".
-
-   Examples:
-     * werewolf demo where 6 LLM-driven players debate each other
-         -> domain: "Werewolf / social deduction"
-         -> essence: "an Agent-vs-Agent simulation harness where LLM players
-            debate, vote and reason; humans are spectators, not players"
-         -> audience: "LLM agents (humans only observe / analyze)"
-     * a Whisper-based offline transcriber CLI
-         -> essence: "an offline batch-processing CLI; not a real-time web app"
-         -> audience: "CLI users / scripted pipelines"
-
-2. Search the web for 3-5 MATURE COMPETITOR PRODUCTS in the same DOMAIN.
-
-3. From competitors, extract concrete features and UI elements that would
-   improve a PRODUCT BUILT FROM THIS DEMO **without changing its essence**.
-   - If the demo is agent-facing, do NOT propose human-multiplayer features
-     like lobby codes, voice chat, ranked ladders — those would change the
-     essence into a different product.
-   - DO propose agent-facing analogues: e.g. instead of "voice chat", suggest
-     "structured wolf-private channel for inter-agent reasoning"; instead of
-     "leaderboard", suggest "agent performance benchmark dashboard".
-   - Be concrete — "login with Google" not "auth".
-
-4. Output STRICT JSON only — no markdown, no commentary.
-"""
-
-ANALYZER_USER_TMPL = """Demo project files:
-{listing}
-
-Top-level documents (truncated):
-{docs}
-
-Return a JSON object with this exact shape:
-{{
-  "domain": "<one sentence>",
-  "essence": "<one or two sentences — the demo's core nature that must NOT change>",
-  "audience": "<one short phrase>",
-  "competitors": ["<product name + 1-line desc>", ...],
-  "features": [
-    {{"name": "...", "category": "backend|frontend|ux|ops|docs", "description": "...", "source": "<competitor name>"}}
-  ],
-  "ui_elements": ["...", ...],
-  "raw_notes": "<short freeform notes, max 500 chars>"
-}}
-Provide 8-15 features. Skip features that would change the audience or essence.
-Skip anything the demo clearly already has.
-"""
-
-
-class Analyzer:
-    def __init__(self, llm: MiniMaxClient, sandbox: Sandbox) -> None:
-        self.llm = llm
-        self.sandbox = sandbox
-
-    def _gather_docs(self) -> str:
-        candidates = ["README.md", "README", "readme.md", "package.json",
-                      "pyproject.toml", "requirements.txt", "main.py", "app.py",
-                      "index.js", "index.ts", "src/main.ts", "Cargo.toml"]
-        chunks = []
-        for c in candidates:
-            txt = self.sandbox.read(c)
-            if txt:
-                chunks.append(f"=== {c} ===\n{txt[:2500]}")
-        return "\n\n".join(chunks) or "(no obvious entry/doc files found)"
-
-    def _build_input(self) -> tuple[str, str]:
-        """Construct (listing, docs) — the exact context fed to the LLM.
-        Extracted so cache fingerprinting can hash the same bytes the model
-        actually sees, instead of approximating with mtime/size."""
-        listing = "\n".join(self.sandbox.listing(max_entries=120))
-        docs = self._gather_docs()
-        return listing, docs
-
-    def fingerprint(self) -> str:
-        """Stable hash of the Analyzer's input. Same bytes → same fingerprint,
-        which means we can safely reuse a previous run's output.
-
-        The fingerprint folds in (a) the project listing, (b) the doc files
-        Analyzer reads, AND (c) the system prompt + provider+model — if the
-        prompt or model changes, you want a fresh analysis. Web-search
-        results from the LLM aren't deterministic so cache hits trade some
-        freshness for big speed/cost wins; pass `--no-cache-analysis` to
-        force a fresh run."""
-        listing, docs = self._build_input()
-        h = hashlib.sha256()
-        h.update(b"d2p-analyzer-v1\n")
-        h.update(ANALYZER_SYS.encode("utf-8"))
-        h.update(b"\n--listing--\n")
-        h.update(listing.encode("utf-8"))
-        h.update(b"\n--docs--\n")
-        h.update(docs.encode("utf-8"))
-        h.update(b"\n--model--\n")
-        h.update(getattr(self.llm, "name", "?").encode("utf-8"))
-        return h.hexdigest()[:16]
-
-    def run(self) -> AnalysisReport:
-        listing, docs = self._build_input()
-        user = ANALYZER_USER_TMPL.format(listing=listing, docs=docs)
-        data = self.llm.chat_json(ANALYZER_SYS, user, web_search=True,
-                                  temperature=0.3, max_tokens=6000)
-        features = [Feature(**_normalize_feature(f)) for f in data.get("features", [])]
-        return AnalysisReport(
-            domain=data.get("domain", ""),
-            essence=data.get("essence", ""),
-            audience=data.get("audience", ""),
-            competitors=list(data.get("competitors", [])),
-            features=features,
-            ui_elements=list(data.get("ui_elements", [])),
-            raw_notes=data.get("raw_notes", ""),
-        )
-
-    def run_cached(self, cache_path: Path,
-                   *, use_cache: bool = True) -> tuple[AnalysisReport, bool]:
-        """Wraps run() with on-disk caching keyed by fingerprint().
-
-        Returns (report, was_cache_hit). The cache file holds a single dict
-        keyed by fingerprint -> serialized AnalysisReport. New fingerprints
-        get appended without evicting older entries (useful for repeated
-        runs against the same demo with different providers)."""
-        fp = self.fingerprint()
-        cache_data: dict[str, Any] = {}
-        if cache_path.is_file():
-            try:
-                cache_data = _json.loads(cache_path.read_text())
-            except _json.JSONDecodeError:
-                cache_data = {}
-        if use_cache and fp in cache_data:
-            d = cache_data[fp]
-            report = AnalysisReport(
-                domain=d.get("domain", ""),
-                essence=d.get("essence", ""),
-                audience=d.get("audience", ""),
-                competitors=list(d.get("competitors", [])),
-                features=[Feature(**_normalize_feature(f))
-                          for f in d.get("features", [])],
-                ui_elements=list(d.get("ui_elements", [])),
-                raw_notes=d.get("raw_notes", ""),
-            )
-            return report, True
-        report = self.run()
-        cache_data[fp] = report.to_dict()
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_text(
-                _json.dumps(cache_data, ensure_ascii=False, indent=2)
-            )
-        except OSError as e:
-            log.warning("analyzer cache write failed: %s", e)
-        return report, False
-
-
-def _normalize_feature(f: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "name": str(f.get("name", "")).strip() or "unnamed",
-        "category": str(f.get("category", "other")).strip().lower(),
-        "description": str(f.get("description", "")).strip(),
-        "source": str(f.get("source", "")).strip(),
-    }
-
-
-# ============ Planner =========================================================
-
-PLANNER_SYS = """You are the Planner agent. You are given:
-  - the analyzer's report, INCLUDING the demo's `essence` and `audience` which
-    must NEVER change,
-  - the existing project's file listing AND key source files in full,
-  - a SYMBOL MAP listing classes/functions/routes already defined,
-  - open QA bug reports (if any),
-  - previous iteration results.
-
-HARD RULES (in priority order):
-
-1. PRESERVE ESSENCE. Every task must respect `analysis.essence` and
-   `analysis.audience`. If a competitor feature would change who the demo is
-   for (e.g. turning an Agent-vs-Agent harness into a human PvP web game),
-   reject it or translate it into an essence-preserving analogue (e.g.
-   instead of "human lobby with chat", propose "agent-vs-agent benchmark
-   harness with structured channels").
-
-2. PROJECT IS NOT EMPTY. Read the symbol map. Do not propose to re-implement
-   anything already present under a different name. Extend the existing
-   symbol rather than create a parallel one.
-
-3. BUGS FIRST. If there are open QA bug reports, the highest-priority task(s)
-   MUST be fixing them. Feature tasks come after.
-
-Decide the next concrete, file-level tasks. Prefer SMALL, INDEPENDENT tasks
-that can run in parallel. For large existing files, instruct the executor to
-use Mode B (SEARCH/REPLACE patches), not full rewrite.
-
-Output STRICT JSON only.
-"""
-
-PLANNER_USER_TMPL = """Analyzer report:
-{analysis}
-
-Project file listing:
-{listing}
-
-Key source files (full contents shown for the most load-bearing ones):
-{key_files}
-
-Symbol map (path -> [classes/functions/routes]):
-{symbol_map}
-
-Open bug reports (failing QA tests from previous iterations):
-{open_bugs}
-
-Previous iteration results (most recent first):
-{history}
-
-Iteration: {iteration} / {max_iter}
-
-Return a JSON object:
-{{
-  "rationale": "<2-3 sentences why these tasks now>",
-  "tasks": [
-    {{
-      "title": "...",
-      "rationale": "...",
-      "target_files": ["relative/path", ...],
-      "instructions": "<concrete instructions for the executor>",
-      "priority": 1,
-      "category": "feature|bugfix|ux|docs|infra"
-    }}
-  ]
-}}
-Constraints:
-- {min_tasks} to {max_tasks} tasks.
-- Every task instruction must restate which aspect of `essence` it preserves.
-- target_files must be paths inside the project. Use new paths for new files.
-- Mention specific existing symbols you want to extend (e.g. "extend GameMaster.vote_phase").
-- For files > 200 lines, instructions must say "use Mode B SEARCH/REPLACE".
-- If there are open bug reports, the highest-priority task MUST be fixing one of them.
-- Skip tasks already attempted-and-done in history.
-"""
-
-
-class Planner:
-    KEY_FILE_CANDIDATES = (
-        "README.md", "README", "readme.md",
-        "main.py", "app.py", "server.py", "index.js", "index.ts",
-        "src/main.ts", "src/index.ts", "src/App.tsx",
-        "package.json", "pyproject.toml", "requirements.txt",
-        "Cargo.toml",
-    )
-
-    def __init__(self, llm: MiniMaxClient, sandbox: Sandbox, *,
-                 max_tasks: int = 5) -> None:
-        self.llm = llm
-        self.sandbox = sandbox
-        self.max_tasks = max_tasks
-
-    def _pick_key_files(self, listing: list[str]) -> list[str]:
-        seen: list[str] = []
-        # explicit candidates first
-        for c in self.KEY_FILE_CANDIDATES:
-            if c in listing and c not in seen:
-                seen.append(c)
-        # then the largest source files (so we don't miss e.g. game.py)
-        sizes: list[tuple[int, str]] = []
-        for p in listing:
-            if not p.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs")):
-                continue
-            try:
-                sz = len(self.sandbox.read(p))
-            except Exception:
-                continue
-            sizes.append((sz, p))
-        sizes.sort(reverse=True)
-        for _, p in sizes[:4]:
-            if p not in seen:
-                seen.append(p)
-        return seen[:8]
-
-    def _build_key_files_block(self, key_files: list[str]) -> str:
-        chunks = []
-        for p in key_files:
-            txt = self.sandbox.read(p)
-            if not txt:
-                continue
-            chunks.append(f"=== {p} ===\n{txt[:5000]}")
-        return "\n\n".join(chunks) or "(none)"
-
-    def run(self, analysis: AnalysisReport, *, iteration: int, max_iter: int,
-            history: list[dict[str, Any]],
-            open_bugs: list[dict[str, Any]] | None = None,
-            feature_cap: int | None = None) -> PlanResult:
-        """Build the next plan. If `feature_cap` is set, the Planner is told
-        to emit at most that many tasks — avoids the previous "Planner
-        produces 5, orchestrator post-hoc trims to 1 under bug debt"
-        pattern that wasted 4× the reasoning budget."""
-        cap = feature_cap if feature_cap is not None else self.max_tasks
-        listing_raw = self.sandbox.listing(max_entries=200)
-        listing_str = "\n".join(listing_raw)
-        # strip the trailing "... (truncated)" marker before symbol/file picking
-        listing = [p for p in listing_raw if not p.startswith("...")]
-        key_files = self._pick_key_files(listing)
-        key_files_block = self._build_key_files_block(key_files)
-        symbol_map = build_symbol_map(self.sandbox.read, listing)
-        # Floor on requested task count: keep at least 3 so the Planner has
-        # room to surface multiple angles; cap on the upper end so it
-        # doesn't go crazy. The lower bound also stops the prompt template
-        # from rendering "3 to 1 tasks" (nonsense) when bug debt forces
-        # cap=1.
-        plan_lo = min(3, cap)
-        user = PLANNER_USER_TMPL.format(
-            analysis=_json.dumps(analysis.to_dict(), ensure_ascii=False, indent=2),
-            listing=listing_str,
-            key_files=key_files_block,
-            symbol_map=_json.dumps(symbol_map, ensure_ascii=False, indent=2),
-            open_bugs=_json.dumps(open_bugs or [], ensure_ascii=False, indent=2),
-            history=_json.dumps(history[-3:], ensure_ascii=False, indent=2) if history else "(none)",
-            iteration=iteration,
-            max_iter=max_iter,
-            min_tasks=plan_lo,
-            max_tasks=cap,
-        )
-        data = self.llm.chat_json(PLANNER_SYS, user, temperature=0.3, max_tokens=6000)
-        tasks = []
-        for t in data.get("tasks", [])[:cap]:
-            tasks.append(Task(
-                id=uuid.uuid4().hex[:8],
-                title=str(t.get("title", "")).strip() or "untitled",
-                rationale=str(t.get("rationale", "")).strip(),
-                target_files=[str(x) for x in t.get("target_files", []) if x],
-                instructions=str(t.get("instructions", "")).strip(),
-                priority=int(t.get("priority", 5) or 5),
-                category=str(t.get("category", "feature")).strip().lower(),
-            ))
-        return PlanResult(iteration=iteration, tasks=tasks,
-                          rationale=str(data.get("rationale", "")))
-
-
-# ============ Executor ========================================================
 
 EXECUTOR_SYS = """You are the Executor agent. You receive ONE task and the
 current contents of the files it targets. You output edits as delimited
@@ -448,11 +108,29 @@ Pick Mode A for new/short files, Mode B for large existing files. Output now.
 
 
 class Executor:
+    # number of times the fix Executor tries to make a failing test green.
+    # Each attempt is one Executor.run() + post_check call. Latency cost is
+    # linear in this; 3 is a good sweet spot from the data.
+    MAX_FIX_ATTEMPTS = 3
+
+    SELF_HEAL_SYS = (
+        "You are the Self-Heal sub-agent. Your previous write produced a "
+        "syntactically-invalid file. Fix ONLY the syntax error. Output the "
+        "complete new file contents in a single ===FILE=== block — no patches, "
+        "no commentary."
+    )
+
     def __init__(self, llm: MiniMaxClient, sandbox: Sandbox,
-                 adapter: Optional[LanguageAdapter] = None) -> None:
+                 adapter: Optional[LanguageAdapter] = None,
+                 usage: Any = None) -> None:
         self.llm = llm
         self.sandbox = sandbox
         self.adapter = adapter or adapter_for(detect_primary_language(sandbox))
+        # Optional UsageAccumulator handle so _self_heal can bump
+        # 'self_heal_attempts' / 'self_heal_succeeded' counters that show
+        # up in summary.json. If None (legacy callers / tests), counters
+        # are a no-op.
+        self.usage = usage
 
     def run(self, task: Task, *,
             post_check: Optional[Callable[[], Tuple[bool, str]]] = None,
@@ -620,11 +298,6 @@ class Executor:
                                   retry_result.summary)[:240]
         return result
 
-    # number of times the fix Executor tries to make a failing test green.
-    # Each attempt is one Executor.run() + post_check call. Latency cost is
-    # linear in this; 3 is a good sweet spot from the data.
-    MAX_FIX_ATTEMPTS = 3
-
     # ---- patch retry on SEARCH miss -----------------------------------------
 
     def _retry_patch(self, *, rel: str, file_content: str,
@@ -648,17 +321,12 @@ class Executor:
 
     # ---- self-heal -----------------------------------------------------------
 
-    SELF_HEAL_SYS = (
-        "You are the Self-Heal sub-agent. Your previous write produced a "
-        "syntactically-invalid file. Fix ONLY the syntax error. Output the "
-        "complete new file contents in a single ===FILE=== block — no patches, "
-        "no commentary."
-    )
-
     def _self_heal(self, rel: str, syntax_err: str, task: Task) -> bool:
         """Ask the model to fix a syntax error in the file we just wrote.
         Returns True if the heal succeeded (file now parses); False otherwise.
         """
+        if self.usage is not None:
+            self.usage.increment("self_heal_attempts")
         broken = self.sandbox.read(rel)
         if not broken or not rel.endswith(".py"):
             return False
@@ -687,6 +355,8 @@ class Executor:
             self.sandbox.write(rel, content)
             if not _post_write_syntax_check(self.sandbox, rel, self.adapter):
                 log.info("self-heal succeeded for %s", rel)
+                if self.usage is not None:
+                    self.usage.increment("self_heal_succeeded")
                 return True
             # heal made it worse — restore broken state so outer rollback works
             self.sandbox.write(rel, broken)

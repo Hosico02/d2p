@@ -1342,5 +1342,110 @@ class TestPlannerFeatureCap(unittest.TestCase):
         self.assertIn("1 to 1 tasks", user_prompt)
 
 
+class TestUsageCounters(unittest.TestCase):
+    def test_counter_increments_threadsafe(self) -> None:
+        import threading as _th
+        from d2p.providers.base import UsageAccumulator
+        u = UsageAccumulator()
+
+        def worker():
+            for _ in range(100):
+                u.increment("self_heal_attempts")
+                u.increment("self_heal_succeeded", 2)
+
+        threads = [_th.Thread(target=worker) for _ in range(4)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        c = u.counters()
+        self.assertEqual(c["self_heal_attempts"], 400)
+        self.assertEqual(c["self_heal_succeeded"], 800)
+        # surfaced in summary
+        self.assertEqual(u.summary()["counters"], c)
+
+
+class TestCompressHistory(unittest.TestCase):
+    def test_strips_big_payloads(self) -> None:
+        from d2p.agents import _compress_history
+        # Synthesise an entry with the kind of payloads that bloat the
+        # Planner prompt (full stdout/stderr per test, etc.).
+        big_qa_output = "x" * 50_000
+        raw = [{
+            "iteration": 1,
+            "results": [
+                {"task_id": "t1", "status": "done",
+                 "files_changed": ["a.py", "b.py", "c.py", "d.py", "e.py"],
+                 "summary": "y" * 5000, "error": ""},
+                {"task_id": "t2", "status": "failed",
+                 "files_changed": [], "summary": "z" * 3000, "error": "oops"},
+            ],
+            "qa_fix_results": [
+                {"task_id": "qa-aaaa", "status": "done", "summary": "a" * 2000},
+            ],
+            "qa": {
+                "new_bugs": [{"title": "n1", "test_path": "p"}],
+                "fixed_bugs": [],
+                "open_bugs": [{"title": "o1"}],
+                "test_runs": {"p": {"output": big_qa_output}},
+            },
+            "retired_this_iter": ["something"],
+        }]
+        out = _compress_history(raw)
+        self.assertEqual(len(out), 1)
+        e = out[0]
+        # iteration preserved
+        self.assertEqual(e["iteration"], 1)
+        # only task_id + status + files (capped to 4) kept from results
+        self.assertEqual(e["results"][0]["task_id"], "t1")
+        self.assertEqual(len(e["results"][0]["files"]), 4)
+        # summary/error gone
+        self.assertNotIn("summary", e["results"][0])
+        self.assertNotIn("error", e["results"][0])
+        # qa.test_runs (the big payload) completely dropped
+        self.assertNotIn("test_runs", e["qa"])
+        # the giant string must not appear anywhere in the compressed form
+        serialised = json.dumps(e)
+        self.assertNotIn(big_qa_output, serialised)
+        self.assertLess(len(serialised), 2000,
+                        f"compressed entry too big: {len(serialised)} bytes")
+
+    def test_empty_input_yields_empty(self) -> None:
+        from d2p.agents import _compress_history
+        self.assertEqual(_compress_history([]), [])
+
+
+class TestStageTimingsInMd(unittest.TestCase):
+    def test_md_renders_stage_breakdown(self) -> None:
+        from unittest.mock import MagicMock
+        from d2p.orchestrator import Orchestrator
+        from d2p.models import PlanResult
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            orch = Orchestrator.__new__(Orchestrator)
+            orch.run_dir = root
+            orch.router = MagicMock()
+            orch.router.usage.summary.return_value = {
+                "total_calls": 0, "total_cost_usd": 0.0,
+                "cache_hit_ratio": 0.0, "per_role": {},
+                "total_input_tokens": 0, "total_output_tokens": 0,
+                "total_cache_creation_tokens": 0, "total_cache_read_tokens": 0,
+                "counters": {},
+            }
+            plan = PlanResult(iteration=1, tasks=[], rationale="r")
+            orch._emit_iter_changes_md(
+                1, plan=plan, results=[], qa_report=None,
+                qa_fix_results=[], retired_this_iter=[],
+                still_open_count=0,
+                elapsed_s=100.0, cost_delta_usd=0.0,
+                stage_timings={"planner_s": 1.5, "executor_s": 30.2,
+                               "qa_s": 12.0, "fix_s": 45.7,
+                               "regression_sweep_s": 8.4},
+            )
+            md = (root / "iter1_changes.md").read_text()
+            self.assertIn("Stage timings:", md)
+            self.assertIn("planner=1.5s", md)
+            self.assertIn("executor=30.2s", md)
+            self.assertIn("fix=45.7s", md)
+
+
 if __name__ == "__main__":
     unittest.main()

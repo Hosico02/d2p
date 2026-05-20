@@ -46,6 +46,10 @@ class UsageAccumulator:
 
     def __init__(self) -> None:
         self._records: list[UsageRecord] = []
+        # Free-form counters surfaced in the summary alongside per-role
+        # usage. Self-heal attempts/successes go here so the user can see
+        # how often the safety net fires without scraping logs.
+        self._counters: dict[str, int] = {}
         self._lock = threading.Lock()
 
     def add(self, *, role: str, model: str, input_tokens: int = 0,
@@ -62,9 +66,18 @@ class UsageAccumulator:
         with self._lock:
             self._records.append(rec)
 
+    def increment(self, key: str, by: int = 1) -> None:
+        """Bump a free-form counter (e.g. 'self_heal_attempts'). Thread-safe."""
+        with self._lock:
+            self._counters[key] = self._counters.get(key, 0) + by
+
     def records(self) -> list[UsageRecord]:
         with self._lock:
             return list(self._records)
+
+    def counters(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._counters)
 
     def summary(self) -> dict[str, Any]:
         per_role: dict[str, dict[str, Any]] = defaultdict(
@@ -103,6 +116,7 @@ class UsageAccumulator:
                 k: {**v, "cost_usd": round(v["cost_usd"], 4)}
                 for k, v in per_role.items()
             },
+            "counters": self.counters(),
         }
 
 
