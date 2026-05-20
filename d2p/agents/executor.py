@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 
 from ..fs import Sandbox
 from ..lang import LanguageAdapter, adapter_for, detect_primary_language
-from ..llm import MiniMaxClient
+from ..providers.base import LLMProvider
 from ..models import ExecutionResult, Task
 
 
@@ -145,7 +145,7 @@ class Executor:
         "no commentary."
     )
 
-    def __init__(self, llm: MiniMaxClient, sandbox: Sandbox,
+    def __init__(self, llm: LLMProvider, sandbox: Sandbox,
                  adapter: Optional[LanguageAdapter] = None,
                  usage: Any = None) -> None:
         self.llm = llm

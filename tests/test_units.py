@@ -1617,5 +1617,125 @@ class TestExecutorParallelLLM(unittest.TestCase):
                 self.assertIsNotNone(r)
 
 
+class TestHtmlReport(unittest.TestCase):
+    def test_render_includes_core_fields(self) -> None:
+        from d2p.report import render_html
+        summary = {
+            "analysis": {"domain": "todo API", "audience": "devs",
+                          "essence": "minimal stateless REST"},
+            "elapsed_s": 100.5,
+            "iterations": [{
+                "iteration": 1,
+                "elapsed_s": 50.0,
+                "cost_delta_usd": 0.1,
+                "cumulative_cost_usd": 0.1,
+                "plan_rationale": "first cut",
+                "stage_timings": {"planner_s": 5.0, "executor_s": 40.0},
+                "results": [
+                    {"task_id": "t1", "status": "done",
+                     "files_changed": ["app.py"]},
+                ],
+                "qa": {"new_bugs": [{"test_path": "tests/d2p_qa/x.py",
+                                      "title": "x bug"}],
+                       "fixed_bugs": [],
+                       "open_bugs": []},
+                "qa_fix_results": [],
+                "retired_this_iter": [],
+            }],
+            "open_bugs": [{"test_path": "tests/d2p_qa/y.py", "title": "y bug",
+                            "attempts": 2, "first_seen_iter": 1}],
+            "run_dir": "/tmp/x",
+            "usage": {
+                "total_calls": 5, "total_cost_usd": 0.123,
+                "cache_hit_ratio": 0.5,
+                "per_role": {"executor:haiku": {"calls": 5, "input": 100,
+                                                  "output": 200,
+                                                  "cache_read": 50,
+                                                  "cache_creation": 50,
+                                                  "cost_usd": 0.123}},
+                "counters": {"self_heal_attempts": 2, "self_heal_succeeded": 1},
+            },
+        }
+        html_str = render_html(summary)
+        # all the load-bearing facts must appear
+        self.assertIn("todo API", html_str)
+        self.assertIn("minimal stateless REST", html_str)
+        self.assertIn("100.5", html_str)
+        self.assertIn("$0.1230", html_str)
+        self.assertIn("Iteration 1", html_str)
+        self.assertIn("first cut", html_str)
+        self.assertIn("tests/d2p_qa/x.py", html_str)
+        self.assertIn("tests/d2p_qa/y.py", html_str)
+        self.assertIn("executor:haiku", html_str)
+        self.assertIn("self_heal_attempts", html_str)
+        # html escaping — title with special chars survives
+        summary["analysis"]["domain"] = "<script>alert(1)</script>"  # type: ignore[index]
+        html_str2 = render_html(summary)
+        self.assertNotIn("<script>alert(1)</script>", html_str2)
+        self.assertIn("&lt;script&gt;", html_str2)
+
+    def test_render_handles_empty(self) -> None:
+        from d2p.report import render_html
+        # minimal summary shouldn't crash
+        out = render_html({"analysis": {}, "iterations": [], "open_bugs": [],
+                            "elapsed_s": 0, "usage": {}, "run_dir": ""})
+        self.assertIn("d2p run report", out)
+
+
+class TestResumeReload(unittest.TestCase):
+    """The orchestrator's _reload_history reconstructs `history` from per-iter
+    JSON files. Without it, --resume would lose all prior-iter context the
+    Planner needs."""
+
+    def test_reload_skips_incomplete_iters(self) -> None:
+        from unittest.mock import MagicMock
+        from d2p.orchestrator import Orchestrator
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            # iter 1: complete (plan + exec + qa + rerun)
+            (root / "plan_iter1.json").write_text(json.dumps({
+                "iteration": 1, "rationale": "iter1 plan",
+                "tasks": [{"id": "t1"}],
+            }))
+            (root / "exec_iter1.json").write_text(json.dumps([
+                {"task_id": "t1", "status": "done", "files_changed": ["a.py"]},
+            ]))
+            (root / "qa_iter1.json").write_text(json.dumps({
+                "new_bugs": [{"test_path": "tests/d2p_qa/bug.py", "title": "b"}],
+                "fixed_bugs": [], "open_bugs": [], "retired_bugs": [],
+                "test_runs": {},
+            }))
+            (root / "qa_rerun_iter1.json").write_text(json.dumps({
+                "tests/d2p_qa/bug.py": {"status": "failed"},
+            }))
+            # iter 2: ONLY plan written — incomplete, should be re-run
+            (root / "plan_iter2.json").write_text(json.dumps({
+                "iteration": 2, "tasks": [],
+            }))
+            # no exec_iter2.json
+
+            orch = Orchestrator.__new__(Orchestrator)
+            orch.run_dir = root
+
+            history, resume_from, open_bugs = orch._reload_history()
+            self.assertEqual(len(history), 1)
+            self.assertEqual(resume_from, 2)
+            self.assertEqual(history[0]["iteration"], 1)
+            # bug carried into next iter (failed in rerun)
+            self.assertEqual(len(open_bugs), 1)
+            self.assertEqual(open_bugs[0]["test_path"], "tests/d2p_qa/bug.py")
+
+    def test_reload_empty_run_dir(self) -> None:
+        from d2p.orchestrator import Orchestrator
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            orch = Orchestrator.__new__(Orchestrator)
+            orch.run_dir = root
+            history, resume_from, open_bugs = orch._reload_history()
+            self.assertEqual(history, [])
+            self.assertEqual(resume_from, 1)
+            self.assertEqual(open_bugs, [])
+
+
 if __name__ == "__main__":
     unittest.main()

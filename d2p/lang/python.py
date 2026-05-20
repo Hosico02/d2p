@@ -33,8 +33,9 @@ def _pick_python_310plus() -> str | None:
                 p = os.path.join(env_dir, name, "bin", "python")
                 if os.path.isfile(p):
                     candidates.append(p)
-    # Homebrew + system pythonX.Y
-    for p in (
+    # Homebrew + system pythonX.Y. shutil.which() returns Optional[str], so
+    # narrow before appending.
+    homebrew_candidates: tuple[str | None, ...] = (
         "/opt/homebrew/bin/python3.13",
         "/opt/homebrew/bin/python3.12",
         "/opt/homebrew/bin/python3.11",
@@ -45,9 +46,12 @@ def _pick_python_310plus() -> str | None:
         shutil.which("python3.12"),
         shutil.which("python3.11"),
         shutil.which("python3.10"),
-    ):
-        if p and os.path.isfile(p):
-            candidates.append(p)
+    )
+    for cand in homebrew_candidates:
+        if cand is None:
+            continue
+        if os.path.isfile(cand):
+            candidates.append(cand)
     # version probe (>=3.10)
     for c in dict.fromkeys(candidates):
         try:

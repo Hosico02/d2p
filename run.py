@@ -26,6 +26,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-cache-analysis", action="store_true",
                    help="force a fresh Analyzer run, ignoring "
                         ".d2p/analysis_cache.json")
+    p.add_argument("--resume", metavar="RUN_DIR",
+                   help="resume a previous interrupted run. RUN_DIR is the "
+                        "<target>/.d2p/run-* directory created by the prior "
+                        "invocation. Rebuilds history from per-iter JSON "
+                        "dumps and continues from the first incomplete iter.")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -41,7 +46,8 @@ def main(argv: list[str] | None = None) -> int:
     cfg.max_concurrent_fixes = args.max_concurrent_fixes
     orch = Orchestrator(args.target, cfg=cfg, max_iterations=args.iter,
                         parallel=args.parallel, enable_qa=not args.no_qa,
-                        use_analyzer_cache=not args.no_cache_analysis)
+                        use_analyzer_cache=not args.no_cache_analysis,
+                        resume_from=args.resume)
     orch.run()
     return 0
 

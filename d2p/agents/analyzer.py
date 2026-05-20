@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from ..fs import Sandbox
-from ..llm import MiniMaxClient
+from ..providers.base import LLMProvider
 from ..models import AnalysisReport, Feature
 
 log = logging.getLogger("d2p.agents.analyzer")
@@ -100,7 +100,7 @@ def _normalize_feature(f: dict[str, Any]) -> dict[str, Any]:
 
 
 class Analyzer:
-    def __init__(self, llm: MiniMaxClient, sandbox: Sandbox) -> None:
+    def __init__(self, llm: LLMProvider, sandbox: Sandbox) -> None:
         self.llm = llm
         self.sandbox = sandbox
 

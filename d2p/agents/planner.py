@@ -15,7 +15,7 @@ import uuid
 from typing import Any
 
 from ..fs import Sandbox
-from ..llm import MiniMaxClient
+from ..providers.base import LLMProvider
 from ..models import AnalysisReport, PlanResult, Task
 from ..symbols import build_symbol_map
 
@@ -147,7 +147,7 @@ class Planner:
         "Cargo.toml",
     )
 
-    def __init__(self, llm: MiniMaxClient, sandbox: Sandbox, *,
+    def __init__(self, llm: LLMProvider, sandbox: Sandbox, *,
                  max_tasks: int = 5) -> None:
         self.llm = llm
         self.sandbox = sandbox

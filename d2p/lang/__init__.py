@@ -13,11 +13,12 @@ from .javascript import JSAdapter
 
 def adapter_for(language: str) -> LanguageAdapter:
     """Return the adapter matching the detected primary language."""
-    return {
+    table: dict[str, LanguageAdapter] = {
         "python": PythonAdapter(),
         "javascript": JSAdapter(),
         "typescript": JSAdapter(),  # TS uses the same node toolchain
-    }.get(language, NullAdapter())
+    }
+    return table.get(language, NullAdapter())
 
 
 __all__ = [

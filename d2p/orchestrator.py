@@ -8,7 +8,7 @@ import threading
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .agents import Analyzer, Executor, Planner
 from .config import Config
@@ -17,6 +17,7 @@ from .health import ProjectHealth
 from .models import ExecutionResult, PlanResult, Task
 from .providers import RoleRouter, build_router
 from .qa import QAAgent
+from .report import write_report
 from .symbols import build_symbol_map
 
 log = logging.getLogger("d2p.orchestrator")
@@ -119,6 +120,7 @@ class Orchestrator:
                  max_iterations: int | None = None,
                  enable_qa: bool = True,
                  use_analyzer_cache: bool = True,
+                 resume_from: str | Path | None = None,
                  router: RoleRouter | None = None) -> None:
         self.cfg = cfg or Config()
         if parallel is not None:
@@ -141,8 +143,20 @@ class Orchestrator:
         self.qa = (QAAgent(self.router.for_role("qa"), self.sandbox)
                    if enable_qa else None)
         self.health = ProjectHealth(self.sandbox)
-        self.run_dir = self.sandbox.root / ".d2p" / time.strftime("run-%Y%m%d-%H%M%S")
-        self.run_dir.mkdir(parents=True, exist_ok=True)
+        # Resume from a prior run_dir vs start a fresh one. On resume, we
+        # reuse the existing dir (so per-iter JSON dumps accumulate) and
+        # mark `resume_from_iter` so run() knows to rebuild history from
+        # the per-iter files on disk. On fresh start, mkdir a new
+        # timestamped dir as before.
+        if resume_from is not None:
+            self.run_dir = Path(resume_from).resolve()
+            if not self.run_dir.is_dir():
+                raise FileNotFoundError(f"resume_from not a dir: {self.run_dir}")
+            log.info("Resuming from %s", self.run_dir)
+        else:
+            self.run_dir = self.sandbox.root / ".d2p" / time.strftime("run-%Y%m%d-%H%M%S")
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+        self._resume = resume_from is not None
 
     # ------------------------------------------------------------------ public
 
@@ -166,6 +180,17 @@ class Orchestrator:
 
         history: list[dict[str, Any]] = []
         open_bugs: list[dict[str, Any]] = []
+        # On resume, rebuild history from the per-iter JSON dumps already
+        # on disk. We pick the lowest iter number that lacks a complete
+        # exec/qa set and continue from there. Iters with full artifacts
+        # are loaded into `history` verbatim so the Planner sees the
+        # same prior context it would have seen.
+        resume_from_iter = 1
+        if self._resume:
+            history, resume_from_iter, open_bugs = self._reload_history()
+            log.info("Resume: rebuilt %d completed iters, continuing from iter %d, "
+                     "%d open bugs",
+                     len(history), resume_from_iter, len(open_bugs))
         # Cumulative cost at the start of each iter — diff with the next
         # measurement gives the per-iter cost delta (cleaner than guessing
         # from per-call records).
@@ -173,7 +198,7 @@ class Orchestrator:
 
         bug_debt_threshold = 12        # P2: raised from 6 → 12
         always_min_features = 1        # P2: even under debt, always allow ≥1
-        for it in range(1, self.cfg.max_iterations + 1):
+        for it in range(resume_from_iter, self.cfg.max_iterations + 1):
             iter_started = time.monotonic()
             log.info("=== iteration %d / %d ===", it, self.cfg.max_iterations)
 
@@ -451,17 +476,24 @@ class Orchestrator:
             "usage": self.router.usage.summary(),
         }
         self._dump("summary.json", summary)
+        # Render a self-contained HTML report alongside the JSON dump.
+        # Single-file, no external CSS/JS, openable from disk — convenient
+        # for sharing without zipping the whole run_dir.
+        try:
+            write_report(summary, self.run_dir / "report.html")
+        except Exception as e:
+            log.warning("HTML report write failed: %s", e)
         log.info("d2p run complete in %.1fs. Artifacts in %s",
                  total_elapsed_s, self.run_dir)
+        u = cast(dict[str, Any], summary["usage"])
         log.info("Usage: %d calls, $%.4f total, cache_hit=%s",
-                 summary["usage"]["total_calls"],
-                 summary["usage"]["total_cost_usd"],
-                 summary["usage"]["cache_hit_ratio"])
+                 u["total_calls"], u["total_cost_usd"], u["cache_hit_ratio"])
         return summary
 
     # ---------------------------------------------------------------- internal
 
     def _run_qa(self, analysis, *, iteration: int) -> tuple[Any, list[Task]]:
+        assert self.qa is not None, "_run_qa called with QA disabled"
         listing = [p for p in self.sandbox.listing(max_entries=200)
                    if not p.startswith("...")]
         # build the same context the Planner gets, so QA targets the right files
@@ -522,9 +554,9 @@ class Orchestrator:
 
         # QA fixes
         if qa_report is not None:
-            fix_done = [r for r in qa_fix_results if r.status == "done"]
+            done_list = [r for r in qa_fix_results if r.status == "done"]
             lines.append(
-                f"## QA fixes ({len(fix_done)}/{len(qa_fix_results)} succeeded)"
+                f"## QA fixes ({len(done_list)}/{len(qa_fix_results)} succeeded)"
             )
             if qa_fix_results:
                 for r in qa_fix_results:
@@ -605,6 +637,7 @@ class Orchestrator:
         )
 
     def _rerun_qa_tests(self, bugs) -> dict[str, dict[str, Any]]:
+        assert self.qa is not None
         out = {}
         for b in bugs:
             out[b.test_path] = self.qa._run_test_file(b.test_path)
@@ -620,21 +653,24 @@ class Orchestrator:
 
     def _test_baseline(self) -> dict[str, bool]:
         """For each test file, True if it currently passes."""
+        assert self.qa is not None
         out: dict[str, bool] = {}
         for p in self._all_corpus_tests():
             out[p] = (self.qa._run_test_file(p)["status"] == "passed")
         return out
 
     def _qa_fix_post_check(self, bug_test_path: str):
+        qa = self.qa
+        assert qa is not None
         def _check() -> tuple[bool, str]:
-            r = self.qa._run_test_file(bug_test_path)
+            r = qa._run_test_file(bug_test_path)
             ok = (r["status"] == "passed")
             # P3: flip _meta.json status the moment the test goes green, so
             # statistics reflect reality this iteration instead of waiting
             # for the next QA sweep to discover it.
             if ok:
                 try:
-                    self.qa.flip_meta_status(bug_test_path, "fixed")
+                    qa.flip_meta_status(bug_test_path, "fixed")
                 except Exception as e:
                     log.warning("status flip failed for %s: %s", bug_test_path, e)
             return (ok, r.get("output", ""))
@@ -784,3 +820,62 @@ class Orchestrator:
     def _dump(self, name: str, payload: Any) -> None:
         path = self.run_dir / name
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    def _reload_history(self) -> tuple[list[dict[str, Any]], int, list[dict[str, Any]]]:
+        """Rebuild orchestrator history from per-iter dumps on disk.
+
+        Returns (history, resume_from_iter, open_bugs).
+
+        An iter is considered "complete" iff at minimum its plan + exec
+        JSON files both exist. Iters that have a plan but no exec (or
+        an exec but no qa_rerun when QA is enabled) get redone — partial
+        work is discarded so the rerun captures the full per-iter
+        artifact set.
+        """
+        def _read(name: str) -> Any:
+            p = self.run_dir / name
+            if not p.is_file():
+                return None
+            try:
+                return json.loads(p.read_text())
+            except json.JSONDecodeError:
+                return None
+
+        history: list[dict[str, Any]] = []
+        open_bugs: list[dict[str, Any]] = []
+        i = 1
+        while True:
+            plan = _read(f"plan_iter{i}.json")
+            results = _read(f"exec_iter{i}.json")
+            if not plan or results is None:
+                # iter i is incomplete — restart from here
+                break
+            qa = _read(f"qa_iter{i}.json")
+            qa_fixes = _read(f"qa_fix_iter{i}.json") or []
+            qa_rerun = _read(f"qa_rerun_iter{i}.json") or {}
+            history.append({
+                "iteration": i,
+                "plan_rationale": plan.get("rationale", ""),
+                "results": results,
+                "qa": qa,
+                "qa_fix_results": qa_fixes,
+                "retired_this_iter": [],
+                # timings unknown post-mortem — best effort
+                "elapsed_s": 0.0,
+                "cost_delta_usd": 0.0,
+                "cumulative_cost_usd": 0.0,
+                "stage_timings": {},
+            })
+            # Re-derive open_bugs from the QA rerun for the most recent
+            # iter — that's the state the next iter would have seen.
+            if qa and qa_rerun:
+                open_bugs = []
+                bugs = (qa.get("new_bugs") or []) + (qa.get("open_bugs") or [])
+                for b in bugs:
+                    tp = b.get("test_path")
+                    if not tp:
+                        continue
+                    if qa_rerun.get(tp, {}).get("status") != "passed":
+                        open_bugs.append(b)
+            i += 1
+        return history, i, open_bugs

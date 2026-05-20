@@ -46,10 +46,12 @@ class MiniMaxProvider:
             max_tokens=max_tokens, temperature=temperature,
         )
         self._record_usage(resp)
-        parts = []
+        parts: list[str] = []
         for block in resp.content or []:
             if getattr(block, "type", None) == "text":
-                parts.append(block.text)
+                txt = getattr(block, "text", "")
+                if txt:
+                    parts.append(txt)
         return "".join(parts).strip()
 
     def _record_usage(self, resp: Any) -> None:

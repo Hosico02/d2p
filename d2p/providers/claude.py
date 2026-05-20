@@ -36,10 +36,14 @@ class ClaudeProvider:
         self.model = model
         self.name = f"claude:{model}@{role}"
         self.usage = usage
-        kwargs = {"api_key": api_key, "timeout": timeout}
         if base_url:
-            kwargs["base_url"] = base_url
-        self._client = anthropic.Anthropic(**kwargs)
+            self._client = anthropic.Anthropic(
+                api_key=api_key, base_url=base_url, timeout=timeout,
+            )
+        else:
+            self._client = anthropic.Anthropic(
+                api_key=api_key, timeout=timeout,
+            )
 
     def chat(self, system: str, user: str, *,
              web_search: bool = False, json_mode: bool = False,
@@ -55,10 +59,15 @@ class ClaudeProvider:
             kwargs["tools"] = [WEB_SEARCH_TOOL]
         resp = self._client.messages.create(**kwargs)
         self._record_usage(resp)
-        parts = []
+        parts: list[str] = []
         for block in resp.content or []:
+            # The Anthropic SDK content union has many block types; only
+            # text blocks expose .text. mypy can't narrow on `block.type`
+            # alone, so hop through getattr.
             if getattr(block, "type", None) == "text":
-                parts.append(block.text)
+                txt = getattr(block, "text", "")
+                if txt:
+                    parts.append(txt)
         return "".join(parts).strip()
 
     def _record_usage(self, resp: Any) -> None:

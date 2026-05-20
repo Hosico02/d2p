@@ -45,7 +45,7 @@ from typing import Any
 
 from .fs import Sandbox
 from .lang import LanguageAdapter, adapter_for, detect_primary_language
-from .llm import MiniMaxClient
+from .providers.base import LLMProvider
 from .models import Task
 
 log = logging.getLogger("d2p.qa")
@@ -191,7 +191,7 @@ Emit 2-4 new test blocks. Each must be likely to FAIL on the current code.
 
 
 class QAAgent:
-    def __init__(self, llm: MiniMaxClient, sandbox: Sandbox,
+    def __init__(self, llm: LLMProvider, sandbox: Sandbox,
                  checklist_path: Path | None = None,
                  adapter: LanguageAdapter | None = None) -> None:
         self.llm = llm
@@ -523,8 +523,16 @@ class QAAgent:
                 status = "passed" if r.returncode == 0 else "failed"
                 return {"status": status, "returncode": r.returncode, "output": output}
             except subprocess.TimeoutExpired as e:
+                # e.stdout/e.stderr are bytes when capture_output=True; decode
+                # explicitly so we don't emit "b'...'" in the output text.
+                def _b2s(x: Any) -> str:
+                    if x is None:
+                        return ""
+                    if isinstance(x, bytes):
+                        return x.decode("utf-8", errors="replace")
+                    return str(x)
                 return {"status": "timeout", "returncode": -1,
-                        "output": f"timeout after 30s\n{e.stdout or ''}\n{e.stderr or ''}"}
+                        "output": f"timeout after 30s\n{_b2s(e.stdout)}\n{_b2s(e.stderr)}"}
             except Exception as e:
                 return {"status": "error", "returncode": -1, "output": str(e)}
 
