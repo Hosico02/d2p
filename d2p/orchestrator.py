@@ -163,6 +163,16 @@ class Orchestrator:
         self._bg_pool = cf.ThreadPoolExecutor(max_workers=1,
                                               thread_name_prefix="d2p-bg")
         self._next_analysis_future: cf.Future | None = None
+        # Race-mode pool. Long-lived so that when the winning side
+        # commits early, we can abandon (not wait on) the slow side's
+        # prepare(). Sized for the worst case: parallel tasks × 2 sides.
+        # Pool keeps running threads even after we stop caring about
+        # their results; on orchestrator shutdown the daemon nature of
+        # subprocess timeouts caps the leak.
+        self._race_pool = cf.ThreadPoolExecutor(
+            max_workers=max(2, self.cfg.parallel_executors * 2),
+            thread_name_prefix="d2p-race",
+        )
 
     # ------------------------------------------------------------------ public
 
@@ -180,9 +190,21 @@ class Orchestrator:
         )
         analyzer_elapsed = round(time.monotonic() - _t0, 1)
         self._dump("analysis.json", analysis.to_dict())
-        log.info("Analyzer (%s): essence=%r audience=%r features=%d",
-                 "cache HIT" if hit else "fresh",
-                 analysis.essence[:80], analysis.audience, len(analysis.features))
+        self._dump("competitors.json",
+                   [c.to_dict() for c in analysis.competitors_detail])
+        self._dump("capabilities.json", analysis.demo_capabilities)
+        self._dump("gap_matrix.json", [f.to_dict() for f in analysis.features])
+        log.info(
+            "Analyzer (%s): essence=%r audience=%r "
+            "competitors=%d capabilities=%d features=%d (gap_high=%d, partial=%d)",
+            "cache HIT" if hit else "fresh",
+            analysis.essence[:80], analysis.audience,
+            len(analysis.competitors_detail),
+            len(analysis.demo_capabilities),
+            len(analysis.features),
+            sum(1 for f in analysis.features if f.gap_severity == "high"),
+            sum(1 for f in analysis.features if f.in_demo == "partial"),
+        )
 
         history: list[dict[str, Any]] = []
         open_bugs: list[dict[str, Any]] = []
@@ -731,14 +753,18 @@ class Orchestrator:
         if fallback_llm is not None:
             log.info("Escalation available (role=%s): fallback=%s",
                      role, fallback_llm.name)
-        # Fix-race mode: race primary + fallback prepare() in parallel so
-        # the escalation LLM call doesn't add to wall time. Only active for
-        # the fix role and only when a fallback is configured + flag set.
-        race_fix = (
-            self.cfg.fix_race and role == "fix" and fallback_llm is not None
-        )
-        if race_fix:
-            log.info("Fix race ENABLED: primary + fallback prepare() in parallel")
+        # Race mode: kick off primary + fallback prepare() in parallel so
+        # the escalation LLM call doesn't add to wall time. Active when
+        # this `role` is in cfg.race_roles AND a fallback is configured.
+        # Inside commit(), we cap max_fix_attempts=1 so we don't compound
+        # race × MAX_FIX_ATTEMPTS=3 (the original opt-in --fix-race bug).
+        race_on = role in self.cfg.race_roles and fallback_llm is not None
+        if race_on:
+            log.info("Race mode ENABLED (role=%s): primary + fallback "
+                     "prepare() in parallel; max_fix_attempts=1", role)
+        elif role in self.cfg.race_roles:
+            log.info("Race mode requested for role=%s but no fallback "
+                     "configured — skipping race", role)
         locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
         results: list[ExecutionResult] = []
         results_lock = threading.Lock()
@@ -817,9 +843,14 @@ class Orchestrator:
             return res, snapshot
 
         def _commit_phase(task: Task, executor: Executor, prepared,
-                          pc) -> tuple[ExecutionResult, dict[str, Any]]:
+                          pc, max_fix_attempts: int | None = None,
+                          ) -> tuple[ExecutionResult, dict[str, Any]]:
             """Locked write phase + post-task probes. Used by both the
-            normal path and the race path."""
+            normal path and the race path.
+
+            `max_fix_attempts=1` is the race-mode cap that prevents
+            race × Executor-retry compounding.
+            """
             keys = sorted(set(task.target_files)) or [f"__notarget__:{task.id}"]
             acquired: list[threading.Lock] = []
             snapshot: dict[str, Any] = {}
@@ -830,7 +861,8 @@ class Orchestrator:
                     acquired.append(lk)
                 snapshot = self.sandbox.snapshot(task.target_files)
                 try:
-                    res = executor.commit(prepared, post_check=pc)
+                    res = executor.commit(prepared, post_check=pc,
+                                          max_fix_attempts=max_fix_attempts)
                 except Exception as e:
                     res = ExecutionResult(task_id=task.id, status="failed",
                                           summary="", error=f"commit: {e}")
@@ -857,33 +889,52 @@ class Orchestrator:
         def _run(idx: int, task: Task) -> None:
             pc = post_check_for(task) if post_check_for else None
 
-            if race_fix:
-                # Race path: kick off primary + fallback prepare() in parallel.
-                # Use a dedicated 2-thread pool so the racing prepares don't
-                # consume slots in the outer task pool.
-                assert fallback_llm is not None  # guarded by race_fix
+            if race_on:
+                # Race v2: submit primary + fallback prepare() to a shared
+                # long-lived pool, then iterate as_completed. As soon as
+                # ONE side finishes successfully, attempt its commit; if
+                # the commit succeeds we ABANDON the slower side (its
+                # thread keeps running until the LLM call returns, but
+                # we don't wait on it). If commit fails, fall through to
+                # the next as_completed result.
+                #
+                # The race itself IS the retry, so commit() is capped at
+                # max_fix_attempts=1 to avoid race × per-executor retry
+                # compounding.
+                assert fallback_llm is not None  # guarded by race_on
                 fb_executor = Executor(fallback_llm, self.sandbox,
                                        usage=self.router.usage)
                 primary_exec = executors[idx % max_workers]
-                with cf.ThreadPoolExecutor(max_workers=2,
-                                            thread_name_prefix="d2p-race") as rp:
-                    f_prim = rp.submit(primary_exec.prepare, task)
-                    f_fb = rp.submit(fb_executor.prepare, task)
-                    prep_primary = f_prim.result()
-                    prep_fallback = f_fb.result()
-                res, _ = _commit_phase(task, primary_exec, prep_primary, pc)
-                if res.status != "done" and _should_escalate(res.error):
-                    log.info("task %s primary failed (%s) — applying RACED "
-                             "fallback (%s)", task.id,
-                             _flatten(res.error, 120), fallback_llm.name)
-                    fb_res, _ = _commit_phase(task, fb_executor, prep_fallback, pc)
-                    if fb_res.status == "done":
-                        fb_res.summary = (fb_res.summary or "") + " [raced]"
-                        res = fb_res
-                    else:
-                        res.error = ((res.error or "") +
-                                     " | raced fallback also failed: " +
-                                     _flatten(fb_res.error, 120))
+                f_prim = self._race_pool.submit(primary_exec.prepare, task)
+                f_fb = self._race_pool.submit(fb_executor.prepare, task)
+                sides = {f_prim: ("primary", primary_exec),
+                         f_fb: ("fallback", fb_executor)}
+                res = None
+                errors: list[str] = []
+                for fut in cf.as_completed([f_prim, f_fb]):
+                    side, ex = sides[fut]
+                    try:
+                        prep = fut.result()
+                    except Exception as e:
+                        errors.append(f"{side}.prepare: {_flatten(str(e), 120)}")
+                        continue
+                    if prep.status == "failed":
+                        errors.append(f"{side}.prepare: {_flatten(prep.llm_error or 'no output', 120)}")
+                        continue
+                    cand, _ = _commit_phase(task, ex, prep, pc,
+                                            max_fix_attempts=1)
+                    if cand.status == "done":
+                        cand.summary = (cand.summary or "") + f" [raced:{side}-won]"
+                        res = cand
+                        log.info("task %s race won by %s (other side abandoned)",
+                                 task.id, side)
+                        break
+                    errors.append(f"{side}.commit: {_flatten(cand.error or '?', 120)}")
+                if res is None:
+                    res = ExecutionResult(
+                        task_id=task.id, status="failed", summary="",
+                        error="race: both sides failed — " + " ; ".join(errors),
+                    )
             else:
                 # Normal path: primary only; sequential escalation on failure.
                 res, _snapshot = _attempt(task, executors[idx % max_workers], pc)

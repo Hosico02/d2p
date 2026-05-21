@@ -85,6 +85,21 @@ HARD RULES (in priority order):
 3. BUGS FIRST. If there are open QA bug reports, the highest-priority task(s)
    MUST be fixing them. Feature tasks come after.
 
+4. RESPECT THE GAP MATRIX. analyzer.features carries `in_demo`,
+   `evidence_in_demo`, and `gap_severity`. Strongly prefer features with
+   `gap_severity=high` and `in_demo=missing`. Skip features with
+   `in_demo=present` unless a clear enhancement is warranted. For
+   `in_demo=partial`, the task must EXTEND the cited evidence_in_demo, not
+   re-implement it from scratch.
+
+5. PATCH ANCHORS FOR LARGE FILES. For any target_file > 200 lines that you
+   want the Executor to patch (Mode B SEARCH/REPLACE), embed a VERBATIM
+   3-5 line excerpt from that file (copy from the key_files block you were
+   given) inside the instructions, labelled "Insertion anchor:" or
+   "Modify near:". This dramatically cuts SEARCH-miss escalations because
+   the Executor can pin the patch site instead of guessing. Without this,
+   patches against large files fail ~30% of the time on the primary model.
+
 Decide the next concrete, file-level tasks. Prefer SMALL, INDEPENDENT tasks
 that can run in parallel. For large existing files, instruct the executor to
 use Mode B (SEARCH/REPLACE patches), not full rewrite.
@@ -192,13 +207,8 @@ class Planner:
         self.sandbox = sandbox
         self.max_tasks = max_tasks
 
-    # Tighter key-files block: 5 files × 3000 chars (was 8 × 5000). The
-    # original was ~40 KB of prompt input per Planner call; the model
-    # pays cache-creation tokens on it every time the codebase shifts.
-    # The 15 KB target keeps the most load-bearing context and trims
-    # the long tail that rarely changes the plan.
-    KEY_FILES_MAX = 5
-    KEY_FILE_CHARS = 3000
+    KEY_FILES_MAX = 8
+    KEY_FILE_CHARS = 5000
 
     def _pick_key_files(self, listing: list[str]) -> list[str]:
         seen: list[str] = []

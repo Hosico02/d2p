@@ -7,10 +7,15 @@ the classes and helper functions from `d2p.agents` exactly as before.
 from __future__ import annotations
 
 from .analyzer import (
-    ANALYZER_SYS,
-    ANALYZER_USER_TMPL,
+    COMPETITOR_SYS,
+    COMPETITOR_USER_TMPL,
+    CAPABILITY_SYS,
+    CAPABILITY_USER_TMPL,
+    GAP_SYS,
+    GAP_USER_TMPL,
     Analyzer,
     _normalize_feature,
+    _normalize_competitor,
 )
 from .planner import (
     PLANNER_SYS,
@@ -42,7 +47,9 @@ __all__ = [
     # agents
     "Analyzer", "Planner", "Executor", "PreparedExecution",
     # prompts
-    "ANALYZER_SYS", "ANALYZER_USER_TMPL",
+    "COMPETITOR_SYS", "COMPETITOR_USER_TMPL",
+    "CAPABILITY_SYS", "CAPABILITY_USER_TMPL",
+    "GAP_SYS", "GAP_USER_TMPL",
     "PLANNER_SYS", "PLANNER_USER_TMPL",
     "EXECUTOR_SYS", "EXECUTOR_USER_TMPL",
     "PATCH_RETRY_SYS",
@@ -50,6 +57,7 @@ __all__ = [
     "parse_executor_output",
     # private helpers (re-exported for the unit-test suite)
     "_normalize_feature",
+    "_normalize_competitor",
     "_compress_history",
     "_apply_post_check_to_result",
     "_apply_search_replace",

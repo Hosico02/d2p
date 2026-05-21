@@ -38,7 +38,10 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
+import concurrent.futures as cf
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -283,15 +286,31 @@ class QAAgent:
         self._ensure_corpus_dir()
         existing = self._list_existing_tests()
 
-        # 1. regression sweep on existing tests
+        # 1. regression sweep on existing tests — parallelised because
+        # this happens BEFORE any fix tasks run, so no live writes can
+        # collide. Each test still respects subprocess timeout=30s, so
+        # worst case for N tests is wall = max(30s, longest_test) per
+        # worker batch instead of sum.
         prior_runs: dict[str, Any] = {}
         prior_failed: list[BugReport] = []
         prior_fixed: list[BugReport] = []
         retired_still_failing: list[BugReport] = []
         prior_meta = self._load_meta()
+        _t_sweep = time.monotonic()
+        if existing:
+            sweep_workers = min(4, max(1, len(existing)))
+            with cf.ThreadPoolExecutor(max_workers=sweep_workers,
+                                        thread_name_prefix="qa-sweep") as pool:
+                outcomes = list(pool.map(
+                    lambda rel: (rel, self._run_test_file(rel, serialize=False)),
+                    existing,
+                ))
+            prior_runs.update({rel: o for rel, o in outcomes})
+        log.info("QA regression-sweep: %d tests in %.1fs (workers=%d)",
+                 len(existing), time.monotonic() - _t_sweep,
+                 min(4, max(1, len(existing))))
         for rel in existing:
-            outcome = self._run_test_file(rel)
-            prior_runs[rel] = outcome
+            outcome = prior_runs[rel]
             meta = prior_meta.get(rel, {})
             prior_status = meta.get("status", "open")
             if outcome["status"] != "passed":
@@ -333,6 +352,7 @@ class QAAgent:
 
         # 2. probe for new bugs (LLM-driven) — no throttle. The real fix to
         # bug-debt is improving fix success rate, not hiding bugs.
+        _t_probe = time.monotonic()
         new_bugs = self._probe_for_new_bugs(
             analysis_summary=analysis_summary,
             essence=essence,
@@ -341,11 +361,23 @@ class QAAgent:
             symbol_map=symbol_map,
             existing_tests=existing,
         )
+        log.info("QA bug-probe: candidate-bugs=%d in %.1fs",
+                 len(new_bugs), time.monotonic() - _t_probe)
 
-        # 3. each new bug runs its test now to confirm it fails (otherwise drop it)
+        # 3. each new bug runs its test now to confirm it fails (otherwise drop it).
+        # Parallel-safe: same reasoning as regression sweep — no fix tasks yet.
+        _t_confirm = time.monotonic()
         confirmed_new: list[BugReport] = []
-        for br in new_bugs:
-            outcome = self._run_test_file(br.test_path)
+        confirm_outcomes: list[tuple[BugReport, dict[str, Any]]] = []
+        if new_bugs:
+            confirm_workers = min(4, max(1, len(new_bugs)))
+            with cf.ThreadPoolExecutor(max_workers=confirm_workers,
+                                        thread_name_prefix="qa-confirm") as pool:
+                confirm_outcomes = list(pool.map(
+                    lambda br: (br, self._run_test_file(br.test_path, serialize=False)),
+                    new_bugs,
+                ))
+        for br, outcome in confirm_outcomes:
             prior_runs[br.test_path] = outcome
             if outcome["status"] != "passed":
                 br.last_failure = outcome["output"][-1500:]
@@ -355,6 +387,9 @@ class QAAgent:
                 # the model misjudged — the "bug" isn't real. Delete the test to
                 # avoid polluting the corpus with green-on-arrival noise.
                 self.sandbox.delete(br.test_path)
+        log.info("QA bug-confirm: %d candidates -> %d real bugs in %.1fs",
+                 len(new_bugs), len(confirmed_new),
+                 time.monotonic() - _t_confirm)
 
         # 4. persist meta. Failing bugs that haven't been retired get fix
         # tasks; retired (wontfix) bugs stay tracked but skip dispatch.
@@ -487,7 +522,8 @@ class QAAgent:
             log.info("QA retired bug %s as wontfix (attempts=%s)",
                      test_path, prior[test_path].get("attempts", "?"))
 
-    def _run_test_file(self, rel_path: str) -> dict[str, Any]:
+    def _run_test_file(self, rel_path: str, *,
+                       serialize: bool = True) -> dict[str, Any]:
         """Run one test file via the adapter's runner. Python falls back to
         unittest with the picked interpreter; JS uses `node --test`; unknown
         languages return a no-op 'unsupported' verdict.
@@ -495,9 +531,13 @@ class QAAgent:
         Thread-safety: all test subprocesses share the demo's sandbox root
         as cwd; two concurrent test runs can collide on shared on-disk
         state (e.g. sqlite files like todos.db, lock files, temp dirs).
-        Serialising through `_test_run_lock` avoids that. The cost is small
-        because individual tests are sub-second and fix tasks rarely run
-        more than a handful of post_checks per iter."""
+        Serialising through `_test_run_lock` avoids that.
+
+        Pass `serialize=False` ONLY when the caller knows no live writes
+        are happening (e.g. iter-1 regression sweep before any fix runs).
+        That path runs lock-free and can be invoked in parallel for a
+        big speedup on demos with 10+ corpus tests.
+        """
         cmd = self.adapter.test_runner_cmd(rel_path, sandbox=self.sandbox)
         if not cmd:
             # Python adapter overrides may be inactive (e.g. NullAdapter);
@@ -513,7 +553,8 @@ class QAAgent:
             # picked interpreter (which has the project's deps installed).
             cmd = [self._test_python] + cmd[1:]
         env = {**os.environ}
-        with self._test_run_lock:
+        ctx: Any = self._test_run_lock if serialize else nullcontext()
+        with ctx:
             try:
                 r = subprocess.run(
                     cmd, cwd=str(self.sandbox.root),

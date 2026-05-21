@@ -9,6 +9,37 @@ from d2p.config import Config
 from d2p.orchestrator import Orchestrator
 
 
+_VALID_RACE_ROLES = {"executor", "fix"}
+
+
+def _parse_race_roles(spec: str) -> set[str]:
+    """Parse the --race-mode CLI value.
+
+    "" (no flag) → empty set (race off everywhere).
+    "none"       → empty set.
+    "all"        → every role we support racing on.
+    "fix"        → {"fix"}.
+    "fix,exec"   → {"fix", "executor"} (also accepts "executor").
+    Unknown role names are dropped with a warning.
+    """
+    if not spec or spec.lower() == "none":
+        return set()
+    if spec.lower() == "all":
+        return set(_VALID_RACE_ROLES)
+    out: set[str] = set()
+    for part in spec.split(","):
+        name = part.strip().lower()
+        # 'exec' is a tolerated alias for 'executor'
+        if name == "exec":
+            name = "executor"
+        if name in _VALID_RACE_ROLES:
+            out.add(name)
+        elif name:
+            logging.warning("ignored unknown race role %r (valid: %s)",
+                            name, sorted(_VALID_RACE_ROLES))
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="d2p — turn a demo into a product")
     p.add_argument("target", help="path to the demo project directory")
@@ -23,11 +54,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-concurrent-fixes", type=int, default=0,
                    help="cap fix tasks per iter (0=no cap). Lowest-attempt "
                         "bugs go first; the rest roll to next iter.")
-    p.add_argument("--fix-race", action="store_true",
-                   help="for fix tasks with a fallback model, race primary "
-                        "+ fallback prepare() in parallel. Skips the ~80s "
-                        "sequential escalation wait when primary fails. "
-                        "Costs 2× fix LLM tokens per task.")
+    p.add_argument("--race-mode", nargs="?", const="all", default="",
+                   metavar="ROLES",
+                   help="enable race-mode for the listed roles (comma-separated). "
+                        "When primary + fallback are both configured for a role, "
+                        "their prepare() calls run in parallel; whichever side "
+                        "commits first wins, slow side is abandoned. Costs 2× "
+                        "LLM tokens per raced task. Accepts: 'all' (default if "
+                        "flag is bare), 'fix', 'executor', 'fix,executor', "
+                        "'none'. Without the flag, race is off everywhere. "
+                        "Race forces max_fix_attempts=1 to avoid race × retry.")
     p.add_argument("--no-cache-analysis", action="store_true",
                    help="force a fresh Analyzer run, ignoring "
                         ".d2p/analysis_cache.json")
@@ -49,7 +85,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg.reanalyze_every = args.reanalyze_every
     cfg.qa_wontfix_after_attempts = args.qa_wontfix_after
     cfg.max_concurrent_fixes = args.max_concurrent_fixes
-    cfg.fix_race = args.fix_race
+    cfg.race_roles = _parse_race_roles(args.race_mode)
     orch = Orchestrator(args.target, cfg=cfg, max_iterations=args.iter,
                         parallel=args.parallel, enable_qa=not args.no_qa,
                         use_analyzer_cache=not args.no_cache_analysis,

@@ -10,6 +10,21 @@ class Feature:
     category: str          # backend | frontend | ux | ops | docs | other
     description: str
     source: str = ""       # competitor or doc link the feature was inferred from
+    # Gap-matrix fields (populated by Analyzer phase-3 gap analysis):
+    in_demo: str = ""              # "missing" | "partial" | "present" | ""
+    evidence_in_demo: str = ""     # short citation (file:line or quote)
+    gap_severity: str = ""         # "low" | "medium" | "high" | ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class CompetitorDetail:
+    name: str
+    key_features: list[str] = field(default_factory=list)
+    source_url: str = ""
+    notes: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -21,6 +36,8 @@ class AnalysisReport:
     essence: str = ""           # the demo's CORE NATURE that must not change
     audience: str = ""          # who/what consumes it (e.g. 'LLM agents', 'humans on web')
     competitors: list[str] = field(default_factory=list)
+    competitors_detail: list[CompetitorDetail] = field(default_factory=list)
+    demo_capabilities: list[str] = field(default_factory=list)
     features: list[Feature] = field(default_factory=list)
     ui_elements: list[str] = field(default_factory=list)
     raw_notes: str = ""
@@ -31,6 +48,8 @@ class AnalysisReport:
             "essence": self.essence,
             "audience": self.audience,
             "competitors": self.competitors,
+            "competitors_detail": [c.to_dict() for c in self.competitors_detail],
+            "demo_capabilities": self.demo_capabilities,
             "features": [f.to_dict() for f in self.features],
             "ui_elements": self.ui_elements,
             "raw_notes": self.raw_notes,

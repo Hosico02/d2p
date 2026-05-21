@@ -202,6 +202,7 @@ class Executor:
 
     def commit(self, prepared: "PreparedExecution", *,
                post_check: Optional[Callable[[], Tuple[bool, str]]] = None,
+               max_fix_attempts: Optional[int] = None,
                ) -> ExecutionResult:
         """Phase 2: apply writes, run syntax check, self-heal, post_check.
         Caller MUST hold the per-file lock(s) for `prepared.task.target_files`.
@@ -336,11 +337,14 @@ class Executor:
         # narrows in on what the test actually wants. Replaces the single-retry
         # design that only fixed bugs ~10% of the time across 10 iters.
         if post_check is not None and result.status == "done":
-            for attempt in range(1, self.MAX_FIX_ATTEMPTS + 1):
+            cap = max_fix_attempts if max_fix_attempts is not None \
+                else self.MAX_FIX_ATTEMPTS
+            cap = max(1, cap)
+            for attempt in range(1, cap + 1):
                 ok, output = post_check()
                 if ok:
                     return result
-                if attempt >= self.MAX_FIX_ATTEMPTS:
+                if attempt >= cap:
                     _apply_post_check_to_result(
                         result, post_check_ok=False, post_check_output=output)
                     break
@@ -350,7 +354,7 @@ class Executor:
                     title=task.title, rationale=task.rationale,
                     target_files=task.target_files,
                     instructions=task.instructions + (
-                        f"\n\n=== RETRY ATTEMPT {attempt}/{self.MAX_FIX_ATTEMPTS - 1} ===\n"
+                        f"\n\n=== RETRY ATTEMPT {attempt}/{cap - 1} ===\n"
                         f"The test STILL fails. Most-actionable error line:\n  {pinpoint}\n\n"
                         f"Full test-output tail:\n{(output or '')[-1200:]}\n\n"
                         f"Pinpoint which function/branch in your previous edit "

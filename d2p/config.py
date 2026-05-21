@@ -47,14 +47,26 @@ class Config:
     # the lowest attempts (i.e. freshest to try, not the ones already
     # circling the drain).
     max_concurrent_fixes: int = 0
-    # When True AND a fallback model is configured for the fix role, the
-    # orchestrator runs primary.prepare() and fallback.prepare() in
-    # PARALLEL on every fix task. If the primary commit fails, the
-    # fallback's prepared LLM output is already available — skip the
-    # sequential ~80s escalation wait. Costs 2× fix LLM calls per task
-    # even when primary succeeds; only worth turning on when haiku fix
-    # success rate is < 70% on the target codebase.
-    fix_race: bool = False
+    # Set of roles for which race-mode is enabled. When a role is in this
+    # set AND a fallback model is configured for it, the orchestrator
+    # runs primary.prepare() and fallback.prepare() in PARALLEL on every
+    # task of that role. The first side to finish gets its commit tried
+    # immediately; if commit succeeds the slow side is abandoned.
+    #
+    # Per-role design: race is a "2× LLM tokens for less wall time" trade.
+    # It pays off most on `fix` tasks (single-task latency is high; primary
+    # often fails on hard bugs anyway). It's a worse trade on `executor`
+    # because feature tasks usually succeed on primary, so race just
+    # doubles cost. Default = empty (race off everywhere).
+    #
+    # When race is active for a role, Executor.commit() is invoked with
+    # max_fix_attempts=1 so we don't compound race × MAX_FIX_ATTEMPTS
+    # (the design bug from the original opt-in `--fix-race`). The race
+    # itself IS the retry.
+    #
+    # CLI accepts: --race-mode (no arg = all), --race-mode fix,
+    # --race-mode executor, --race-mode fix,executor, --race-mode none.
+    race_roles: set[str] = field(default_factory=set)
 
     def require_key(self) -> None:
         if not self.api_key:
