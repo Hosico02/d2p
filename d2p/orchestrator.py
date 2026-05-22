@@ -747,28 +747,23 @@ class Orchestrator:
         - Default parallel_executors bumped to 4.
         """
         max_workers = max(1, min(self.cfg.parallel_executors, len(tasks)))
-        executor_llm = self.router.for_role(role)
-        log.info("Task batch (role=%s) using %s", role, executor_llm.name)
-        # Per-task fresh Executor instances. The internal max_fix_attempts loop
-        # plus the optional escalation-to-fallback path own the task end-to-end;
-        # only on `done` (or final escalation failure) does the instance get
-        # released. No cross-task reuse — guarantees clean state per task.
-        fallback_llm = self.router.for_fallback(role)
-        if fallback_llm is not None:
-            log.info("Escalation available (role=%s): fallback=%s",
-                     role, fallback_llm.name)
-        # Race mode: kick off primary + fallback prepare() in parallel so
-        # the escalation LLM call doesn't add to wall time. Active when
-        # this `role` is in cfg.race_roles AND a fallback is configured.
-        # Inside commit(), we cap max_fix_attempts=1 so we don't compound
-        # race × MAX_FIX_ATTEMPTS=3 (the original opt-in --fix-race bug).
-        race_on = role in self.cfg.race_roles and fallback_llm is not None
-        if race_on:
-            log.info("Race mode ENABLED (role=%s): primary + fallback "
+        ladder_len = self.router.ladder_length(role)
+        # Log the routing for this batch — each tier shows up as a separate
+        # provider, so users can see what's actually going to be dispatched.
+        tier_names = [self.router.for_role_tier(role, i).name
+                      for i in range(ladder_len)]
+        log.info("Task batch (role=%s) ladder: %s", role, " -> ".join(tier_names))
+        # Tasks are dispatched at their own tier_idx (carried over from
+        # prior iters by the feature queue / bug ledger). A fresh Executor
+        # is built per task with the matching tier provider.
+        race_on = role in self.cfg.race_roles
+        if race_on and ladder_len < 2:
+            log.info("Race mode requested for role=%s but ladder has only "
+                     "%d tier(s) — skipping race", role, ladder_len)
+            race_on = False
+        elif race_on:
+            log.info("Race mode ENABLED (role=%s): primary(tier_idx) + next-tier "
                      "prepare() in parallel; max_fix_attempts=1", role)
-        elif role in self.cfg.race_roles:
-            log.info("Race mode requested for role=%s but no fallback "
-                     "configured — skipping race", role)
         locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
         results: list[ExecutionResult] = []
         results_lock = threading.Lock()
@@ -893,27 +888,27 @@ class Orchestrator:
         def _run(idx: int, task: Task) -> None:
             pc = post_check_for(task) if post_check_for else None
 
-            if race_on:
-                # Race v2: submit primary + fallback prepare() to a shared
-                # long-lived pool, then iterate as_completed. As soon as
-                # ONE side finishes successfully, attempt its commit; if
-                # the commit succeeds we ABANDON the slower side (its
-                # thread keeps running until the LLM call returns, but
-                # we don't wait on it). If commit fails, fall through to
-                # the next as_completed result.
-                #
-                # The race itself IS the retry, so commit() is capped at
-                # max_fix_attempts=1 to avoid race × per-executor retry
-                # compounding.
-                assert fallback_llm is not None  # guarded by race_on
-                fb_executor = Executor(fallback_llm, self.sandbox,
-                                       usage=self.router.usage)
-                primary_exec = Executor(executor_llm, self.sandbox,
+            # Per-task tier provider — the task carries its tier_idx from
+            # the queue. tier 0 is the cheap default; tasks re-queued from
+            # a prior iter arrive at higher tiers.
+            primary_llm = self.router.for_role_tier(role, task.tier_idx)
+            log.info("task %s tier=%d using %s",
+                     task.id, task.tier_idx, primary_llm.name)
+            if race_on and task.tier_idx + 1 < ladder_len:
+                # Race v2: kick off primary tier + next tier in parallel.
+                # Whichever finishes prepare first attempts commit; if the
+                # commit succeeds we abandon the slower side. The race
+                # itself IS the retry, so commit() is capped at
+                # max_fix_attempts=1.
+                next_llm = self.router.for_role_tier(role, task.tier_idx + 1)
+                primary_exec = Executor(primary_llm, self.sandbox,
                                         usage=self.router.usage)
+                fb_executor = Executor(next_llm, self.sandbox,
+                                       usage=self.router.usage)
                 f_prim = self._race_pool.submit(primary_exec.prepare, task)
                 f_fb = self._race_pool.submit(fb_executor.prepare, task)
                 sides = {f_prim: ("primary", primary_exec),
-                         f_fb: ("fallback", fb_executor)}
+                         f_fb: ("next-tier", fb_executor)}
                 res = None
                 errors: list[str] = []
                 for fut in cf.as_completed([f_prim, f_fb]):
@@ -941,33 +936,13 @@ class Orchestrator:
                         error="race: both sides failed — " + " ; ".join(errors),
                     )
             else:
-                # Normal path: primary only; sequential escalation on failure.
-                # Fresh Executor bound to this task for its full lifecycle
-                # (prepare + commit + internal max_fix_attempts retries).
-                primary_exec = Executor(executor_llm, self.sandbox,
+                # Normal path: per-task fresh Executor at its current tier.
+                # No within-iter escalation — failed tasks get bumped by the
+                # carry-over queue and retried with the stronger tier model
+                # in the NEXT iter (replaces the old fallback path).
+                primary_exec = Executor(primary_llm, self.sandbox,
                                         usage=self.router.usage)
                 res, _snapshot = _attempt(task, primary_exec, pc)
-
-                if res.status != "done" and fallback_llm is not None:
-                    if _should_escalate(res.error):
-                        log.info("task %s failed (%s) — escalating to %s",
-                                 task.id, _flatten(res.error, 120),
-                                 fallback_llm.name)
-                        fb_executor = Executor(fallback_llm, self.sandbox,
-                                               usage=self.router.usage)
-                        fb_res, _ = _attempt(task, fb_executor, pc)
-                        if fb_res.status == "done":
-                            fb_res.summary = (fb_res.summary or "") + " [escalated]"
-                            res = fb_res
-                        else:
-                            # keep the original error too — debug visibility for users
-                            # who want to know which model failed which way
-                            res.error = ((res.error or "") +
-                                         " | escalation also failed: " +
-                                         _flatten(fb_res.error, 120))
-                    else:
-                        log.info("task %s failed structurally (%s) — skipping escalation",
-                                 task.id, _flatten(res.error, 120))
 
             log.info("task %s [%s] -> %s (%d files)",
                      task.id, task.title[:60], res.status, len(res.files_changed))
