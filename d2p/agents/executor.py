@@ -255,8 +255,16 @@ class Executor:
             # though each op looks innocuous (cf. player.py 108→28 incident).
             reject = _guard_destructive_write(rel, existing, new_content)
             if reject:
-                rejected.append(f"{rel}: {reject}")
-                continue
+                retry_ok, retry_content, retry_err = self._retry_destructive(
+                    rel=rel, existing=existing, attempted=new_content, task=task,
+                )
+                if retry_ok:
+                    log.info("destructive-write recovered via small-patch "
+                             "retry on %s", rel)
+                    new_content = retry_content
+                else:
+                    rejected.append(f"{rel}: {reject} (retry: {retry_err})")
+                    continue
             try:
                 self.sandbox.write(rel, new_content)
             except Exception as e:
@@ -297,8 +305,16 @@ class Executor:
                 continue
             reject = _guard_destructive_write(rel, existing, content)
             if reject:
-                rejected.append(f"{rel}: {reject}")
-                continue
+                retry_ok, retry_content, retry_err = self._retry_destructive(
+                    rel=rel, existing=existing, attempted=content, task=task,
+                )
+                if retry_ok:
+                    log.info("destructive-write (FILE-mode) recovered via "
+                             "small-patch retry on %s", rel)
+                    content = retry_content
+                else:
+                    rejected.append(f"{rel}: {reject} (retry: {retry_err})")
+                    continue
             try:
                 written = self.sandbox.write(rel, content)
             except Exception as e:
@@ -408,6 +424,49 @@ class Executor:
 
     # ---- patch retry on SEARCH miss -----------------------------------------
 
+    def _retry_destructive(self, *, rel: str, existing: str,
+                           attempted: str, task: Task,
+                           ) -> tuple[bool, str, str]:
+        """Recovery for a blocked destructive rewrite.
+
+        Tells the model explicitly that its previous output would have
+        shrunk the file from X to Y lines, shows the real file with line
+        numbers, and demands a small SEARCH/REPLACE patch. Returns
+        (ok, new_content, error_msg). On failure new_content is unchanged.
+        """
+        old_lines = existing.count("\n") + 1
+        new_lines = attempted.count("\n") + 1
+        user = (
+            f"File: {rel}\n"
+            f"Task: {task.title}\n\n"
+            f"Your previous output would have shrunk this file from "
+            f"{old_lines} to {new_lines} lines. That is destructive and "
+            f"was BLOCKED. You must preserve the existing structure.\n\n"
+            f"Actual current file with line numbers:\n"
+            f"{_with_line_numbers(existing)}\n\n"
+            f"Original task instructions:\n{task.instructions[:2000]}\n\n"
+            f"Emit ONE small ===PATCH=== block that makes the smallest "
+            f"possible change to satisfy the task. SEARCH text must match "
+            f"the file above byte-for-byte. Do NOT emit a full ===FILE=== "
+            f"rewrite — small patch only."
+        )
+        try:
+            raw = self.llm.chat(DESTRUCTIVE_RETRY_SYS, user,
+                                temperature=0.1, max_tokens=8000)
+        except Exception as e:
+            return False, existing, f"llm-error: {_re.sub(chr(10), ' ', str(e))[:120]}"
+        parsed = parse_executor_output(raw)
+        for path, ops in parsed["patches"]:
+            if path != rel:
+                continue
+            new_content, miss = _apply_search_replace(existing, ops)
+            if miss:
+                return False, existing, f"search-miss: {miss[:80]!r}"
+            if _guard_destructive_write(rel, existing, new_content):
+                return False, existing, "retry-still-destructive"
+            return True, new_content, ""
+        return False, existing, "no-patch-emitted"
+
     def _retry_patch(self, *, rel: str, file_content: str,
                      misses: list[str], task: Task) -> tuple[str, str]:
         """One-shot retry when SEARCH text wasn't found. Returns (new_content, miss).
@@ -477,6 +536,16 @@ PATCH_RETRY_SYS = (
     "shown the actual file (with line numbers) and the failing SEARCH texts. "
     "Emit a single fresh ===PATCH=== block whose SEARCH texts are copied "
     "byte-for-byte from the file. Do not invent code that is not present."
+)
+
+
+DESTRUCTIVE_RETRY_SYS = (
+    "Your previous output would have rewritten an entire file with a much "
+    "smaller version — that's destructive and was BLOCKED by the sandbox. "
+    "You will be shown the actual current file. Emit ONE ===PATCH=== block "
+    "with the SMALLEST possible SEARCH/REPLACE edit that satisfies the "
+    "task. SEARCH must match the file byte-for-byte. NEVER emit a full "
+    "===FILE=== rewrite for this retry."
 )
 
 
