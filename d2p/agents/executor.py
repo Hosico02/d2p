@@ -475,13 +475,45 @@ class Executor:
 
     def _retry_patch(self, *, rel: str, file_content: str,
                      misses: list[str], task: Task) -> tuple[str, str]:
-        """One-shot retry when SEARCH text wasn't found. Returns (new_content, miss).
-        miss is empty on success.
+        """Two-shot retry when SEARCH text wasn't found.
+
+        Attempt 1: same-tier (self.llm). Cheap; often the model just
+        needs to re-read the file with line numbers.
+        Attempt 2: heal_llm (next tier) when configured. Haiku tends to
+        invent anchors; sonnet+ tends to copy them faithfully.
+
+        Returns (new_content, miss). miss is empty iff one attempt
+        succeeded; otherwise the last failing miss.
         """
+        first = self._retry_patch_one(
+            rel=rel, file_content=file_content, misses=misses,
+            task=task, llm=self.llm,
+        )
+        new_content, miss = first
+        if not miss:
+            return first
+        # Escalate to heal_llm (next tier) — only adds 1 LLM call on the
+        # failure path. When at top tier (heal_llm is None), skip; the
+        # carry-over queue will retry next iter at the same top tier.
+        if self.heal_llm is None or self.heal_llm is self.llm:
+            return first
+        second = self._retry_patch_one(
+            rel=rel, file_content=file_content, misses=misses + [miss],
+            task=task, llm=self.heal_llm,
+        )
+        if not second[1]:
+            log.info("SEARCH-miss recovered via tier escalation on %s "
+                     "(heal_llm=%s)", rel, getattr(self.heal_llm, "name", "?"))
+        return second
+
+    def _retry_patch_one(self, *, rel: str, file_content: str,
+                         misses: list[str], task: Task,
+                         llm: LLMProvider) -> tuple[str, str]:
+        """Single retry call with `llm`. Returns (new_content, miss)."""
         user = _format_patch_retry_user(rel, file_content, misses, task.title)
         try:
-            raw = self.llm.chat(PATCH_RETRY_SYS, user, temperature=0.1,
-                                max_tokens=8000)
+            raw = llm.chat(PATCH_RETRY_SYS, user, temperature=0.1,
+                           max_tokens=8000)
         except Exception:
             return file_content, misses[0] if misses else "retry-llm-failed"
         parsed = parse_executor_output(raw)
