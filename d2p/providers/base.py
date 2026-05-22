@@ -100,8 +100,12 @@ class UsageAccumulator:
         total_output = sum(r.output_tokens for r in records)
         total_cache_read = sum(r.cache_read_tokens for r in records)
         total_cache_creation = sum(r.cache_creation_tokens for r in records)
-        # cache-hit ratio = read / (read + creation). 1.0 = perfect cache.
-        cache_total = total_cache_read + total_cache_creation
+        # cache-hit ratio = read / (read + creation + uncached-input).
+        # Includes raw input_tokens in the denominator so providers that
+        # report cache_read but never cache_creation (e.g. MiniMax) don't
+        # falsely show 1.0. For claude-cli (input≈0) this matches the old
+        # formula within rounding.
+        cache_total = total_cache_read + total_cache_creation + total_input
         cache_hit_ratio = (round(total_cache_read / cache_total, 3)
                            if cache_total else 0.0)
         return {

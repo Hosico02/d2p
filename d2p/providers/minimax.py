@@ -17,6 +17,18 @@ from .base import UsageAccumulator
 log = logging.getLogger("d2p.providers.minimax")
 
 
+# USD per token. Source: cloudprice.net / pricepertoken.com (May 2026).
+# Unknown models fall back to (0, 0, 0) so cost shows 0 instead of crashing.
+_PRICING: dict[str, tuple[float, float, float]] = {
+    # (input_per_token, output_per_token, cache_read_per_token)
+    "MiniMax-M2.7-highspeed": (0.6 / 1_000_000, 2.4 / 1_000_000, 0.06 / 1_000_000),
+    "MiniMax-M2.7":           (0.279 / 1_000_000, 1.2 / 1_000_000, 0.0279 / 1_000_000),
+    "MiniMax-M2.5-highspeed": (0.6 / 1_000_000, 2.4 / 1_000_000, 0.06 / 1_000_000),
+    "MiniMax-M2.5":           (0.279 / 1_000_000, 1.2 / 1_000_000, 0.0279 / 1_000_000),
+    "MiniMax-M2":             (0.3 / 1_000_000, 1.2 / 1_000_000, 0.03 / 1_000_000),
+}
+
+
 class MiniMaxProvider:
     def __init__(self, *, api_key: str, model: str,
                  base_url: str = "https://api.minimaxi.com/anthropic",
@@ -61,12 +73,20 @@ class MiniMaxProvider:
         if u is None:
             return
         try:
+            in_t = getattr(u, "input_tokens", 0) or 0
+            out_t = getattr(u, "output_tokens", 0) or 0
+            cc_t = getattr(u, "cache_creation_input_tokens", 0) or 0
+            cr_t = getattr(u, "cache_read_input_tokens", 0) or 0
+            # Estimate USD cost from the per-token rate table. MiniMax's
+            # Anthropic-compat response carries no cost field, so without
+            # this we'd always log $0 — making model comparisons impossible.
+            rates = _PRICING.get(self.model, (0.0, 0.0, 0.0))
+            cost = in_t * rates[0] + out_t * rates[1] + cr_t * rates[2]
             self.usage.add(
                 role=self.role, model=self.model,
-                input_tokens=getattr(u, "input_tokens", 0) or 0,
-                output_tokens=getattr(u, "output_tokens", 0) or 0,
-                cache_creation_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
-                cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
+                input_tokens=in_t, output_tokens=out_t,
+                cache_creation_tokens=cc_t, cache_read_tokens=cr_t,
+                cost_usd=cost,
             )
         except Exception as e:
             log.debug("usage record failed (%s): %s", self.name, e)

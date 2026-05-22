@@ -746,9 +746,10 @@ class Orchestrator:
         max_workers = max(1, min(self.cfg.parallel_executors, len(tasks)))
         executor_llm = self.router.for_role(role)
         log.info("Task batch (role=%s) using %s", role, executor_llm.name)
-        executors = [Executor(executor_llm, self.sandbox,
-                              usage=self.router.usage)
-                     for _ in range(max_workers)]
+        # Per-task fresh Executor instances. The internal max_fix_attempts loop
+        # plus the optional escalation-to-fallback path own the task end-to-end;
+        # only on `done` (or final escalation failure) does the instance get
+        # released. No cross-task reuse — guarantees clean state per task.
         fallback_llm = self.router.for_fallback(role)
         if fallback_llm is not None:
             log.info("Escalation available (role=%s): fallback=%s",
@@ -904,7 +905,8 @@ class Orchestrator:
                 assert fallback_llm is not None  # guarded by race_on
                 fb_executor = Executor(fallback_llm, self.sandbox,
                                        usage=self.router.usage)
-                primary_exec = executors[idx % max_workers]
+                primary_exec = Executor(executor_llm, self.sandbox,
+                                        usage=self.router.usage)
                 f_prim = self._race_pool.submit(primary_exec.prepare, task)
                 f_fb = self._race_pool.submit(fb_executor.prepare, task)
                 sides = {f_prim: ("primary", primary_exec),
@@ -937,7 +939,11 @@ class Orchestrator:
                     )
             else:
                 # Normal path: primary only; sequential escalation on failure.
-                res, _snapshot = _attempt(task, executors[idx % max_workers], pc)
+                # Fresh Executor bound to this task for its full lifecycle
+                # (prepare + commit + internal max_fix_attempts retries).
+                primary_exec = Executor(executor_llm, self.sandbox,
+                                        usage=self.router.usage)
+                res, _snapshot = _attempt(task, primary_exec, pc)
 
                 if res.status != "done" and fallback_llm is not None:
                     if _should_escalate(res.error):

@@ -603,8 +603,10 @@ class TestUsageAccumulator(unittest.TestCase):
         s = u.summary()
         self.assertEqual(s["total_calls"], 3)
         self.assertAlmostEqual(s["total_cost_usd"], 0.0215, places=4)
-        # cache hit ratio = read / (read+creation) = 100 / 200 = 0.5
-        self.assertEqual(s["cache_hit_ratio"], 0.5)
+        # cache hit ratio = read / (read+creation+input) = 100 / (100+100+215) = 0.241
+        # input is in the denominator so MiniMax-style usage (cc=0, large
+        # raw input) doesn't falsely report a perfect cache hit.
+        self.assertAlmostEqual(s["cache_hit_ratio"], 0.241, places=3)
         self.assertIn("executor:haiku", s["per_role"])
         self.assertEqual(s["per_role"]["executor:haiku"]["calls"], 2)
         self.assertEqual(s["per_role"]["executor:haiku"]["input"], 15)
