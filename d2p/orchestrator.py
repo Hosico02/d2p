@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import json
+import uuid
 import logging
 import threading
 import time
@@ -282,7 +283,6 @@ class Orchestrator:
                 max_iter=self.cfg.max_iterations,
                 history=history, open_bugs=open_bugs,
                 feature_cap=feature_cap,
-                failed_attempts=self._load_failed_attempts_for_planner(),
             )
             stage_t["planner_s"] = round(time.monotonic() - _t, 1)
             self._dump(f"plan_iter{it}.json", plan.to_dict())
@@ -971,11 +971,6 @@ class Orchestrator:
 
             log.info("task %s [%s] -> %s (%d files)",
                      task.id, task.title[:60], res.status, len(res.files_changed))
-            if res.status != "done":
-                self._record_failed_task(
-                    task, res.error or "", iteration=self._current_iter,
-                    role=role,
-                )
             with results_lock:
                 results.append(res)
 
@@ -989,71 +984,86 @@ class Orchestrator:
         path = self.run_dir / name
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
 
-    # ---- Failed-task ledger (C) -------------------------------------------
+    # ---- Feature carry-over queue (E2) ------------------------------------
+    #
+    # Tasks that don't reach `status=done` in an iter are persisted here so
+    # the next iter picks them up automatically (with their tier_idx bumped,
+    # see _advance_task_after_attempt). qa-* and restore-* are handled by the
+    # QA bug ledger separately.
+    #
+    # Lives outside per-run dir so multiple runs on the same project share
+    # state — useful if a user does --resume or runs again.
+    MAX_TOP_TIER_RETRIES = 3
+
     @property
-    def _failed_tasks_path(self) -> Path:
-        """Persistent across runs on the same project — lives at the .d2p
-        root, not under the per-run dir, so Planner sees prior runs' dead
-        ends too."""
-        return self.sandbox.root / ".d2p" / "failed_tasks.json"
+    def _feature_queue_path(self) -> Path:
+        return self.sandbox.root / ".d2p" / "feature_queue.json"
 
-    def _record_failed_task(self, task: Task, error: str,
-                            *, iteration: int, role: str) -> None:
-        """Append a failure record. Dedupes nothing — read side aggregates.
-        Skips qa-* and restore-* (those are tracked via the bug ledger)."""
-        if task.id.startswith("qa-") or task.id.startswith("restore-"):
-            return
-        try:
-            rec = {
-                "title": task.title[:160],
-                "target_files": list(task.target_files),
-                "error": _flatten(error or "", 240),
-                "iteration": iteration,
-                "role": role,
-                "run_dir": self.run_dir.name,
-            }
-            path = self._failed_tasks_path
-            existing: list[dict[str, Any]] = []
-            if path.is_file():
-                try:
-                    existing = json.loads(path.read_text())
-                except Exception:
-                    existing = []
-            existing.append(rec)
-            # cap the file so it doesn't grow unbounded
-            existing = existing[-200:]
-            path.write_text(json.dumps(existing, ensure_ascii=False, indent=2))
-        except Exception as e:
-            log.warning("failed_tasks ledger write skipped: %s", e)
-
-    def _load_failed_attempts_for_planner(self) -> list[dict[str, Any]]:
-        """Return an aggregated list the Planner can reason about. Groups
-        by (title, target_files-tuple) so the planner sees "this exact task
-        signature failed N times" rather than N separate near-duplicates."""
-        path = self._failed_tasks_path
+    def _load_feature_queue(self) -> list[Task]:
+        path = self._feature_queue_path
         if not path.is_file():
             return []
         try:
             raw = json.loads(path.read_text())
         except Exception:
             return []
-        groups: dict[tuple[str, tuple[str, ...]], dict[str, Any]] = {}
-        for rec in raw:
-            key = (str(rec.get("title", "")),
-                   tuple(rec.get("target_files") or []))
-            g = groups.get(key)
-            if g is None:
-                g = {
-                    "title": rec.get("title", ""),
-                    "target_files": list(rec.get("target_files") or []),
-                    "failed_count": 0,
-                    "last_error": rec.get("error", ""),
-                }
-                groups[key] = g
-            g["failed_count"] += 1
-            g["last_error"] = rec.get("error", g["last_error"])
-        # Sort by failed_count desc, cap at 20 so we don't bloat the prompt
-        return sorted(groups.values(), key=lambda g: -g["failed_count"])[:20]
+        out: list[Task] = []
+        for d in raw:
+            try:
+                out.append(Task(**d))
+            except TypeError:
+                # schema mismatch (older entry) — best-effort revival
+                out.append(Task(
+                    id=str(d.get("id") or uuid.uuid4().hex[:8]),
+                    title=str(d.get("title", "")),
+                    rationale=str(d.get("rationale", "")),
+                    target_files=list(d.get("target_files") or []),
+                    instructions=str(d.get("instructions", "")),
+                    priority=int(d.get("priority", 5) or 5),
+                    category=str(d.get("category", "feature") or "feature"),
+                    tier_idx=int(d.get("tier_idx", 0) or 0),
+                    attempts=list(d.get("attempts") or []),
+                ))
+        return out
+
+    def _save_feature_queue(self, tasks: list[Task]) -> None:
+        path = self._feature_queue_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps([t.to_dict() for t in tasks],
+                                    ensure_ascii=False, indent=2))
+
+    def _advance_task_after_attempt(self, task: Task, result: ExecutionResult,
+                                    *, ladder_len: int) -> Task | None:
+        """Record this attempt's outcome and decide whether the task stays
+        in the queue for the next iter. Returns the updated task to keep,
+        or None to drop (done / dead).
+
+        - done → drop (success)
+        - failed + below top tier → bump tier_idx, keep
+        - failed + at top tier with attempts_at_top < MAX_TOP_TIER_RETRIES → keep, retry same tier
+        - failed + at top tier with attempts_at_top >= MAX_TOP_TIER_RETRIES → drop (dead)
+        """
+        task.attempts.append({
+            "tier_idx": task.tier_idx,
+            "iteration": self._current_iter,
+            "status": result.status,
+            "error": _flatten(result.error or "", 240) if result.status != "done" else "",
+        })
+        if result.status == "done":
+            return None
+        top_tier = max(0, ladder_len - 1)
+        if task.tier_idx < top_tier:
+            task.tier_idx += 1
+            return task
+        # At the top tier already — count attempts at this tier
+        top_attempts = sum(1 for a in task.attempts
+                          if a.get("tier_idx") == top_tier)
+        if top_attempts >= self.MAX_TOP_TIER_RETRIES:
+            log.info("task %s [%s] marked dead after %d top-tier retries",
+                     task.id, task.title[:60], top_attempts)
+            return None
+        # Keep at top tier for another retry
+        return task
 
     def _reload_history(self) -> tuple[list[dict[str, Any]], int, list[dict[str, Any]]]:
         """Rebuild orchestrator history from per-iter dumps on disk.

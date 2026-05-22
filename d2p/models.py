@@ -69,6 +69,12 @@ class Task:
     notes: str = ""
     forbidden_files: list[str] = field(default_factory=list)  # never write these
     # ^ used by QA-fix tasks to protect the test file from being edited
+    # Cross-iter tier escalation. Tasks carried over from a prior iter
+    # arrive with tier_idx > 0; the orchestrator picks the matching ladder
+    # provider when dispatching. attempts records every prior pass so
+    # diagnostics can show the trail.
+    tier_idx: int = 0
+    attempts: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
