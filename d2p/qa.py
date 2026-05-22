@@ -377,19 +377,33 @@ class QAAgent:
                     lambda br: (br, self._run_test_file(br.test_path, serialize=False)),
                     new_bugs,
                 ))
+        dropped_self_broken = 0
+        dropped_passing = 0
         for br, outcome in confirm_outcomes:
             prior_runs[br.test_path] = outcome
-            if outcome["status"] != "passed":
-                br.last_failure = outcome["output"][-1500:]
-                br.first_seen_iter = iteration
-                confirmed_new.append(br)
-            else:
-                # the model misjudged — the "bug" isn't real. Delete the test to
-                # avoid polluting the corpus with green-on-arrival noise.
+            if outcome["status"] == "passed":
+                # bug-probe misjudged — test is green. Delete to keep the
+                # corpus clean.
                 self.sandbox.delete(br.test_path)
-        log.info("QA bug-confirm: %d candidates -> %d real bugs in %.1fs",
+                dropped_passing += 1
+                continue
+            if _test_is_self_broken(outcome.get("output", ""), br.test_path):
+                # Test crashes inside itself (TypeError / SyntaxError /
+                # ImportError in test code) — fixing the SUT can't satisfy
+                # a test that can't run. Drop to avoid wasting fix budget
+                # on unwinnable tasks.
+                log.info("QA bug-drop (self-broken): %s", br.test_path)
+                self.sandbox.delete(br.test_path)
+                dropped_self_broken += 1
+                continue
+            br.last_failure = outcome["output"][-1500:]
+            br.first_seen_iter = iteration
+            confirmed_new.append(br)
+        log.info("QA bug-confirm: %d candidates -> %d real bugs in %.1fs "
+                 "(dropped: %d self-broken, %d passing)",
                  len(new_bugs), len(confirmed_new),
-                 time.monotonic() - _t_confirm)
+                 time.monotonic() - _t_confirm,
+                 dropped_self_broken, dropped_passing)
 
         # 4. persist meta. Failing bugs that haven't been retired get fix
         # tasks; retired (wontfix) bugs stay tracked but skip dispatch.
@@ -659,6 +673,41 @@ class QAAgent:
 _MISSING_SYM_RE = re.compile(
     r"ImportError:\s*cannot import name ['\"]([A-Za-z_][\w]*)['\"]\s+from\s+['\"]([\w.]+)['\"]"
 )
+
+
+def _test_is_self_broken(output: str, test_path: str) -> bool:
+    """A test is "self-broken" if its failure is in test-code rather than in
+    the SUT. Examples we want to drop:
+      - SyntaxError / IndentationError parsing the test file
+      - ImportError for stdlib/test-only imports
+      - TypeError / NameError raised on a line inside the test file itself
+        (e.g. `"x" in result` when result is a bool — common bug-probe quirk)
+
+    Heuristic: parse the unittest output for the LAST traceback. If the
+    final frame's file path matches `test_path`, the test crashed in its
+    own code, not in the SUT — drop it.
+
+    AssertionError is always treated as a real bug regardless of frame, since
+    that's literally what a passing-then-failing assertion looks like.
+    """
+    if not output:
+        return False
+    # If the output contains an AssertionError, that's a legit bug signal.
+    if "AssertionError" in output:
+        return False
+    # Hard-fail signals that mean the test file itself can't even load.
+    for marker in ("SyntaxError:", "IndentationError:",
+                   "ModuleNotFoundError:"):
+        if marker in output:
+            return True
+    # Otherwise inspect the last traceback frame.
+    test_basename = os.path.basename(test_path)
+    frames = re.findall(r'File "([^"]+)", line (\d+)', output)
+    if not frames:
+        return False
+    last_path, _ = frames[-1]
+    # Frame inside the test file → broken test
+    return os.path.basename(last_path) == test_basename
 
 
 def detect_missing_symbol_failures(text: str) -> list[tuple[str, str]]:
