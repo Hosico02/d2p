@@ -340,6 +340,10 @@ class Executor:
             cap = max_fix_attempts if max_fix_attempts is not None \
                 else self.MAX_FIX_ATTEMPTS
             cap = max(1, cap)
+            # Accumulate every attempt's summary so each retry sees the full
+            # trail of "what we tried that didn't work". Without this the
+            # model often re-tries the same edit it just made.
+            attempt_log: list[str] = [f"attempt 0 (initial): {result.summary[:160]}"]
             for attempt in range(1, cap + 1):
                 ok, output = post_check()
                 if ok:
@@ -349,6 +353,11 @@ class Executor:
                         result, post_check_ok=False, post_check_output=output)
                     break
                 pinpoint = _extract_assertion_summary(output)
+                # Snapshot current file contents so the retry sees the ACTUAL
+                # post-edit state of the SUT — kills anchor hallucination and
+                # lets the model reason about what its own previous patch did.
+                current_state = _format_current_files(
+                    self.sandbox, task.target_files, max_chars_per_file=4000)
                 retry_task = Task(
                     id=f"{task.id}-retry{attempt}",
                     title=task.title, rationale=task.rationale,
@@ -356,15 +365,24 @@ class Executor:
                     instructions=task.instructions + (
                         f"\n\n=== RETRY ATTEMPT {attempt}/{cap - 1} ===\n"
                         f"The test STILL fails. Most-actionable error line:\n  {pinpoint}\n\n"
-                        f"Full test-output tail:\n{(output or '')[-1200:]}\n\n"
-                        f"Pinpoint which function/branch in your previous edit "
-                        f"does NOT satisfy this assertion, and rewrite ONLY "
-                        f"that piece. Smaller, more precise diff."
+                        f"Prior attempts on this task:\n" +
+                        "\n".join(f"  - {line}" for line in attempt_log) + "\n\n"
+                        f"Current state of target files (after your previous edits):\n"
+                        f"{current_state}\n\n"
+                        f"Full test-output tail:\n{(output or '')[-1500:]}\n\n"
+                        f"Look at the test assertion + your file state above. "
+                        f"Pinpoint which function/branch does NOT satisfy "
+                        f"the assertion, and rewrite ONLY that piece. "
+                        f"Smaller, more precise diff."
                     ),
                     priority=task.priority, category=task.category,
                     forbidden_files=task.forbidden_files,
                 )
                 retry_result = self.run(retry_task)
+                attempt_log.append(
+                    f"attempt {attempt} ({retry_result.status}): "
+                    f"{(retry_result.summary or retry_result.error or '?')[:160]}"
+                )
                 if retry_result.status != "done":
                     # the retry write itself failed (search-miss / syntax /
                     # destructive-shrink). No point continuing — surface
@@ -524,6 +542,35 @@ def _extract_assertion_summary(test_output: str, max_chars: int = 240) -> str:
     # fallback — last non-blank line
     lines = [l for l in test_output.splitlines() if l.strip()]
     return (lines[-1] if lines else "(empty)")[:max_chars]
+
+
+def _format_current_files(sandbox: "Sandbox", paths: list[str], *,
+                          max_chars_per_file: int = 4000) -> str:
+    """Snapshot target files for the retry prompt. Caps each at
+    max_chars_per_file so a 2k-line template doesn't blow the context.
+    Larger files get head + tail rather than head-only — the tail often
+    contains the function the LLM just edited."""
+    parts: list[str] = []
+    for rel in paths:
+        try:
+            content = sandbox.read(rel)
+        except Exception as e:
+            parts.append(f"--- {rel} ---\n(read failed: {e})")
+            continue
+        if not content:
+            parts.append(f"--- {rel} ---\n(empty)")
+            continue
+        if len(content) <= max_chars_per_file:
+            parts.append(f"--- {rel} ({len(content)} chars) ---\n{content}")
+            continue
+        head_n = max_chars_per_file // 2
+        tail_n = max_chars_per_file - head_n
+        parts.append(
+            f"--- {rel} ({len(content)} chars, truncated) ---\n"
+            f"{content[:head_n]}\n... [middle omitted] ...\n"
+            f"{content[-tail_n:]}"
+        )
+    return "\n\n".join(parts) if parts else "(no target files)"
 
 
 def _apply_post_check_to_result(res: ExecutionResult, *,
