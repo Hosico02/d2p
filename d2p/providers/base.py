@@ -194,11 +194,16 @@ class RoleRouter:
 
     def __init__(self, providers: dict[str, LLMProvider],
                  usage: UsageAccumulator | None = None,
-                 fallbacks: dict[str, LLMProvider] | None = None) -> None:
+                 fallbacks: dict[str, LLMProvider] | None = None,
+                 ladders: dict[str, list[LLMProvider]] | None = None) -> None:
         if not providers:
             raise ValueError("RoleRouter needs at least one provider")
         self._providers = dict(providers)
         self._fallbacks: dict[str, LLMProvider] = dict(fallbacks or {})
+        # role -> ordered ladder of providers; tier 0 = primary, tier N = strongest.
+        # Tasks that fail get re-queued for next iter at tier_idx+1 (executor.py
+        # owns the bump; orchestrator dispatches per task at its current tier).
+        self._ladders: dict[str, list[LLMProvider]] = dict(ladders or {})
         # ensure every default role resolves: missing → fall back to 'default'
         if "default" not in self._providers:
             self._providers["default"] = next(iter(providers.values()))
@@ -211,11 +216,33 @@ class RoleRouter:
         """Return the role's escalation provider if configured, else None."""
         return self._fallbacks.get(role)
 
+    def for_role_tier(self, role: str, tier_idx: int) -> LLMProvider:
+        """Return the provider at `tier_idx` of `role`'s ladder. If no ladder
+        is configured for the role, falls back to for_role. tier_idx is
+        clamped to [0, len(ladder)-1] so callers can pass an arbitrary
+        bumped index without bounds-checking themselves."""
+        ladder = self._ladders.get(role)
+        if not ladder:
+            return self.for_role(role)
+        clamped = max(0, min(tier_idx, len(ladder) - 1))
+        return ladder[clamped]
+
+    def ladder_length(self, role: str) -> int:
+        """How many tiers `role` has. 1 means no real ladder — a task at
+        tier 0 that fails has nowhere to escalate to, so retries 3× at the
+        top tier per the dead-task policy."""
+        ladder = self._ladders.get(role)
+        return len(ladder) if ladder else 1
+
     def describe(self) -> dict[str, str]:
         """{role: provider.name} — useful for logging the active routing.
-        Fallback roles appear as `<role>-fallback`."""
+        Fallback roles appear as `<role>-fallback`. Ladder roles appear as
+        `<role>-tier<N>`."""
         out = {role: self._providers.get(role, self._providers["default"]).name
                for role in set(list(self._providers.keys()) + list(self.DEFAULT_ROLES))}
         for role, fp in self._fallbacks.items():
             out[f"{role}-fallback"] = fp.name
+        for role, ladder in self._ladders.items():
+            for i, p in enumerate(ladder):
+                out[f"{role}-tier{i}"] = p.name
         return out

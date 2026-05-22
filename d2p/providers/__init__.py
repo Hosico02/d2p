@@ -15,6 +15,37 @@ from .codex import CodexProvider
 from .minimax import MiniMaxProvider
 
 
+# Default tier ladders per provider, per role. Tier 0 is the cheap/fast
+# primary; tier N is the strongest. A task that fails at tier_idx N gets
+# requeued for the next iter at tier_idx min(N+1, len(ladder)-1). At the
+# top tier we retry 3× before marking the task dead.
+#
+# Only `executor` and `fix` get ladders — analyzer/planner/qa are one-shot
+# reasoning calls where retrying at a stronger model isn't meaningful in
+# the same way (a planner that produces a bad plan needs a re-plan, not
+# the same prompt at a bigger model).
+DEFAULT_LADDERS: dict[str, dict[str, list[str]]] = {
+    "claude": {
+        "executor": ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-7"],
+        "fix":      ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-7"],
+    },
+    "claude-cli": {
+        "executor": ["haiku", "sonnet", "opus"],
+        "fix":      ["haiku", "sonnet", "opus"],
+    },
+    "codex": {
+        "executor": ["gpt-4o-mini", "gpt-4o"],
+        "fix":      ["gpt-4o-mini", "gpt-4o"],
+    },
+    "minimax": {
+        # Single-tier: no real escalation between MiniMax models. Top-tier
+        # retry policy (3x at top before dead) takes over for failing tasks.
+        "executor": ["MiniMax-M2.7-highspeed"],
+        "fix":      ["MiniMax-M2.7-highspeed"],
+    },
+}
+
+
 # Sensible per-role defaults — Hiku/mini on hot path, Opus/4o on reasoning.
 DEFAULT_ROLE_MODELS: dict[str, dict[str, str]] = {
     "claude": {
@@ -60,6 +91,11 @@ class ProviderSpec:
     # Triggered by orchestrator when a task fails — retries once with the
     # fallback model. Empty by default = no escalation.
     fallback_models: dict[str, str] = field(default_factory=dict)
+    # Per-role tier ladder: { "executor": ["haiku","sonnet","opus"], ... }.
+    # Carry-over queue uses this to bump a failing task's tier_idx each
+    # iter. Defaults from DEFAULT_LADDERS[kind]; env overrides via
+    # D2P_ROLE_<ROLE>_LADDER=a,b,c.
+    role_ladders: dict[str, list[str]] = field(default_factory=dict)
 
 
 def _from_env() -> ProviderSpec:
@@ -88,6 +124,7 @@ def _from_env() -> ProviderSpec:
     # role overrides from env (D2P_ROLE_EXECUTOR_MODEL=...)
     overrides: dict[str, str] = {}
     fallbacks: dict[str, str] = {}
+    ladder_overrides: dict[str, list[str]] = {}
     for role in ("executor", "fix", "analyzer", "planner", "qa", "default"):
         env_name = f"D2P_ROLE_{role.upper()}_MODEL"
         v = os.environ.get(env_name)
@@ -97,12 +134,18 @@ def _from_env() -> ProviderSpec:
         fb = os.environ.get(fb_env)
         if fb:
             fallbacks[role] = fb
+        ladder_env = f"D2P_ROLE_{role.upper()}_LADDER"
+        ladder_v = os.environ.get(ladder_env)
+        if ladder_v:
+            ladder_overrides[role] = [m.strip() for m in ladder_v.split(",")
+                                       if m.strip()]
     role_models = {**DEFAULT_ROLE_MODELS.get(kind, {}), **overrides}
+    role_ladders = {**DEFAULT_LADDERS.get(kind, {}), **ladder_overrides}
 
     return ProviderSpec(
         kind=kind, api_key=key, base_url=base,
         default_model=default_model, role_models=role_models,
-        fallback_models=fallbacks,
+        fallback_models=fallbacks, role_ladders=role_ladders,
     )
 
 
@@ -175,11 +218,26 @@ def build_router(spec: ProviderSpec | None = None,
             s.kind, api_key=s.api_key, base_url=s.base_url, model=fb_model,
             role=f"{role}-fallback", working_dir=working_dir, usage=usage,
         )
-    return RoleRouter(providers, usage=usage, fallbacks=fallbacks)
+    # Tier ladders: one provider per (role, tier_idx). Each tier gets its
+    # own role label `<role>-tier<idx>` so per-tier usage shows in the cost
+    # summary — makes it visible how often we had to escalate.
+    ladders: dict[str, list[LLMProvider]] = {}
+    for role, ladder_models in s.role_ladders.items():
+        if role == "default" or not ladder_models:
+            continue
+        ladders[role] = [
+            _make_provider(
+                s.kind, api_key=s.api_key, base_url=s.base_url, model=m,
+                role=f"{role}-tier{idx}", working_dir=working_dir, usage=usage,
+            )
+            for idx, m in enumerate(ladder_models)
+        ]
+    return RoleRouter(providers, usage=usage, fallbacks=fallbacks,
+                      ladders=ladders)
 
 
 __all__ = [
     "LLMProvider", "RoleRouter", "ProviderSpec", "UsageAccumulator",
     "MiniMaxProvider", "ClaudeProvider", "ClaudeCLIProvider", "CodexProvider",
-    "build_router", "DEFAULT_ROLE_MODELS",
+    "build_router", "DEFAULT_ROLE_MODELS", "DEFAULT_LADDERS",
 ]
