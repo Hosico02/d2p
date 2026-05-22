@@ -277,32 +277,77 @@ class Orchestrator:
             # Per-stage timings — surfaced in iter md and summary.json so
             # users can see where each iter spent its wall-clock budget.
             stage_t: dict[str, float] = {}
+            # Carry-over tasks from prior iter's failures arrive here with
+            # their tier_idx already bumped (see _advance_task_after_attempt).
+            # They consume the feature_cap budget first; Planner only adds
+            # NEW tasks to fill any remaining slots.
+            carried_over = self._load_feature_queue()
+            carry_cap = min(len(carried_over), feature_cap)
+            new_cap = max(0, feature_cap - carry_cap)
+            if carried_over:
+                log.info("Carry-over queue: %d feature tasks "
+                         "(running %d this iter; tier_idx distribution: %s)",
+                         len(carried_over), carry_cap,
+                         {t: sum(1 for x in carried_over[:carry_cap] if x.tier_idx == t)
+                          for t in sorted({x.tier_idx for x in carried_over[:carry_cap]})})
+
             _t = time.monotonic()
-            plan = self.planner.run(
-                analysis, iteration=it,
-                max_iter=self.cfg.max_iterations,
-                history=history, open_bugs=open_bugs,
-                feature_cap=feature_cap,
-            )
+            if new_cap > 0:
+                plan = self.planner.run(
+                    analysis, iteration=it,
+                    max_iter=self.cfg.max_iterations,
+                    history=history, open_bugs=open_bugs,
+                    feature_cap=new_cap,
+                )
+            else:
+                # Queue alone fills the budget — skip the planner LLM call.
+                from .models import PlanResult
+                plan = PlanResult(iteration=it, tasks=[],
+                                  rationale="(skipped; carry-over queue saturated feature_cap)")
             stage_t["planner_s"] = round(time.monotonic() - _t, 1)
             self._dump(f"plan_iter{it}.json", plan.to_dict())
-            log.info("Planner produced %d tasks (cap=%d) in %.1fs",
-                     len(plan.tasks), feature_cap, stage_t["planner_s"])
-            # P2: defence in depth — Planner already targets <= feature_cap,
+            log.info("Planner produced %d new tasks (new_cap=%d) in %.1fs",
+                     len(plan.tasks), new_cap, stage_t["planner_s"])
+            # P2: defence in depth — Planner already targets <= new_cap,
             # but trim+resort here in case it overshot. Small/low-risk first.
             plan.tasks = sorted(plan.tasks,
-                                key=lambda t: (t.priority, len(t.target_files)))[:feature_cap]
-            if not plan.tasks:
-                log.info("Planner emitted no tasks — converged.")
+                                key=lambda t: (t.priority, len(t.target_files)))[:new_cap]
+            # Order of dispatch: carry-overs first (they're at higher tiers,
+            # often bug-adjacent and worth resolving before new feature scope
+            # gets layered on top).
+            dispatched = list(carried_over[:carry_cap]) + list(plan.tasks)
+            remaining_queue = list(carried_over[carry_cap:])
+            if not dispatched:
+                log.info("No tasks (queue empty, planner emitted none) — converged.")
                 break
             _t = time.monotonic()
-            results = self._run_tasks_parallel(plan.tasks)
+            results = self._run_tasks_parallel(dispatched)
             stage_t["executor_s"] = round(time.monotonic() - _t, 1)
 
             self._dump(f"exec_iter{it}.json", [r.to_dict() for r in results])
             done = sum(1 for r in results if r.status == "done")
             log.info("Iteration %d: %d/%d feature tasks done in %.1fs",
                      it, done, len(results), stage_t["executor_s"])
+
+            # Update the carry-over queue: each dispatched task gets
+            # advanced (drop on done / bump tier / dead at top). Tasks we
+            # didn't dispatch this iter (remaining_queue) stay as-is.
+            ladder_len = self.router.ladder_length("executor")
+            res_by_id = {r.task_id: r for r in results}
+            next_queue: list[Task] = list(remaining_queue)
+            for t in dispatched:
+                r = res_by_id.get(t.id)
+                if r is None:
+                    next_queue.append(t)  # safety: never dispatched
+                    continue
+                advanced = self._advance_task_after_attempt(
+                    t, r, ladder_len=ladder_len)
+                if advanced is not None:
+                    next_queue.append(advanced)
+            self._save_feature_queue(next_queue)
+            if next_queue:
+                log.info("Feature queue now: %d task(s) pending for next iter",
+                         len(next_queue))
 
             qa_report = None
             qa_fix_results: list[ExecutionResult] = []
