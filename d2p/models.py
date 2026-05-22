@@ -98,6 +98,11 @@ class ExecutionResult:
     summary: str
     files_changed: list[str] = field(default_factory=list)
     error: str = ""
+    # If the task was rolled back due to a baseline regression, these are
+    # the module/test names that went green→red. Stored on the task's
+    # carry-over attempts so the next retry sees "your previous patch
+    # broke X, Y — avoid those" in its prompt.
+    regressed: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -26,24 +26,25 @@ log = logging.getLogger("d2p.orchestrator")
 
 def _rollback_if_health_regressed(sandbox: Sandbox, probe: ProjectHealth,
                                   *, baseline: dict[str, str],
-                                  snapshot: dict[str, Any]) -> bool:
-    """If any module that WAS healthy in `baseline` is now broken, restore the
-    snapshot and return True. Otherwise return False (writes are kept).
+                                  snapshot: dict[str, Any]) -> list[str]:
+    """If any module that WAS healthy in `baseline` is now broken, restore
+    the snapshot and return the list of regressed module names. Empty list
+    means no rollback happened.
 
     This catches the case where ast.parse passes but a symbol got deleted,
     breaking other modules that import it.
     """
     if not baseline:
-        return False
+        return []
     current = probe.probe(list(baseline.keys()))
     regressed = [m for m, status in current.items()
                  if baseline.get(m) == "ok" and status != "ok"]
     if not regressed:
-        return False
+        return []
     log.warning("HEALTH REGRESSION in %s — rolling back. errors: %s",
                 regressed, {m: current[m][:80] for m in regressed})
     sandbox.restore(snapshot)
-    return True
+    return regressed
 
 
 def _discover_pre_existing_tests(sandbox: Sandbox) -> list[str]:
@@ -58,6 +59,62 @@ def _discover_pre_existing_tests(sandbox: Sandbox) -> list[str]:
     return out
 
 
+def _decorate_with_attempt_history(task: Task) -> Task:
+    """Return a copy of `task` whose instructions are prefixed with a
+    summary of prior attempts (tier used, status, what regressed). Used
+    to inject "what didn't work" context before a carry-over dispatch so
+    the next tier model doesn't re-break the same baseline tests.
+
+    No-op when task.attempts is empty (fresh planner output).
+    """
+    if not task.attempts:
+        return task
+    lines: list[str] = ["=== PRIOR ATTEMPTS ON THIS TASK ==="]
+    regressed_all: list[str] = []
+    for i, a in enumerate(task.attempts, 1):
+        tier = a.get("tier_idx", "?")
+        status = a.get("status", "?")
+        err = (a.get("error") or "").strip()
+        regs = a.get("regressed") or []
+        regressed_all.extend(regs)
+        line = f"  attempt {i} (tier={tier}, status={status})"
+        if err:
+            line += f": {err[:160]}"
+        lines.append(line)
+        if regs:
+            lines.append(f"    rolled back; broke: {regs}")
+    if regressed_all:
+        # Dedupe while preserving order
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for r in regressed_all:
+            if r in seen:
+                continue
+            seen.add(r)
+            uniq.append(r)
+        lines.append("")
+        lines.append("CRITICAL: previous patches caused the following "
+                     "baseline tests/modules to go green→red:")
+        for r in uniq:
+            lines.append(f"  - {r}")
+        lines.append("Do NOT make a change that re-breaks them. Confine "
+                     "your edit; consider a smaller, more surgical diff.")
+    lines.append("=== END PRIOR ATTEMPTS ===")
+    decorated = "\n".join(lines) + "\n\n" + task.instructions
+    # Return a new Task with the decorated instructions but everything
+    # else unchanged. The queue file still holds the original.
+    return Task(
+        id=task.id, title=task.title, rationale=task.rationale,
+        target_files=list(task.target_files),
+        instructions=decorated,
+        priority=task.priority, category=task.category,
+        status=task.status, notes=task.notes,
+        forbidden_files=list(task.forbidden_files),
+        tier_idx=task.tier_idx,
+        attempts=list(task.attempts),
+    )
+
+
 def _flatten(msg: str, max_len: int = 200) -> str:
     """Single-line, length-capped form of an error string. Without flattening,
     a multi-line Traceback inside the log line shreds grep + monitor output
@@ -70,13 +127,17 @@ def _flatten(msg: str, max_len: int = 200) -> str:
 
 def _rollback_if_baseline_test_regressed(sandbox: Sandbox, qa,
                                          *, baseline: dict[str, bool],
-                                         snapshot: dict[str, Any]) -> bool:
+                                         snapshot: dict[str, Any]) -> list[str]:
     """For each demo-author test that PASSED at baseline, verify it still
     passes. If any flipped to fail/error, rollback. This catches RUNTIME
     regressions (e.g. dataclass `field()` misuse) that import-probe misses.
+
+    Returns the list of regressed test paths (empty = no rollback). Stops
+    at the first regression so we don't waste time running the rest of
+    the corpus once we know we're rolling back.
     """
     if not baseline:
-        return False
+        return []
     for path, was_passing in baseline.items():
         if not was_passing:
             continue
@@ -84,8 +145,8 @@ def _rollback_if_baseline_test_regressed(sandbox: Sandbox, qa,
         if r["status"] != "passed":
             log.warning("BASELINE TEST REGRESSION: %s — rolling back", path)
             sandbox.restore(snapshot)
-            return True
-    return False
+            return [path]
+    return []
 
 
 class Orchestrator:
@@ -859,20 +920,21 @@ class Orchestrator:
 
             # --- Phase 3: probes / rollback (unlocked) ---
             if res.status == "done":
-                rolled = _rollback_if_health_regressed(
+                regressed = _rollback_if_health_regressed(
                     self.sandbox, self.health,
                     baseline=cached_health_baseline, snapshot=snapshot,
                 )
-                if not rolled and cached_test_baseline and self.qa is not None:
-                    rolled = _rollback_if_baseline_test_regressed(
+                if not regressed and cached_test_baseline and self.qa is not None:
+                    regressed = _rollback_if_baseline_test_regressed(
                         self.sandbox, self.qa,
                         baseline=cached_test_baseline, snapshot=snapshot,
                     )
-                if rolled:
+                if regressed:
                     res.status = "failed"
                     res.error = ((res.error + " | ") if res.error else "") + \
                                 "regression detected — rolled back"
                     res.files_changed = []
+                    res.regressed = list(regressed)
             return res, snapshot
 
         def _commit_phase(task: Task, executor: Executor, prepared,
@@ -903,20 +965,21 @@ class Orchestrator:
                 for lk in acquired:
                     lk.release()
             if res.status == "done":
-                rolled = _rollback_if_health_regressed(
+                regressed = _rollback_if_health_regressed(
                     self.sandbox, self.health,
                     baseline=cached_health_baseline, snapshot=snapshot,
                 )
-                if not rolled and cached_test_baseline and self.qa is not None:
-                    rolled = _rollback_if_baseline_test_regressed(
+                if not regressed and cached_test_baseline and self.qa is not None:
+                    regressed = _rollback_if_baseline_test_regressed(
                         self.sandbox, self.qa,
                         baseline=cached_test_baseline, snapshot=snapshot,
                     )
-                if rolled:
+                if regressed:
                     res.status = "failed"
                     res.error = ((res.error + " | ") if res.error else "") + \
                                 "regression detected — rolled back"
                     res.files_changed = []
+                    res.regressed = list(regressed)
             return res, snapshot
 
         def _run(idx: int, task: Task) -> None:
@@ -928,6 +991,9 @@ class Orchestrator:
             primary_llm = self.router.for_role_tier(role, task.tier_idx)
             log.info("task %s tier=%d using %s",
                      task.id, task.tier_idx, primary_llm.name)
+            # F3: prepend prior-attempt context (regressions, failures) so
+            # carry-over retries don't re-break the same baseline tests.
+            task = _decorate_with_attempt_history(task)
             # Heal model = next tier when available, else same tier.
             # _self_heal uses it for the 2nd-attempt syntax rescue. The
             # task's persistent tier_idx is NOT bumped — this is local
@@ -1068,6 +1134,7 @@ class Orchestrator:
             "iteration": self._current_iter,
             "status": result.status,
             "error": _flatten(result.error or "", 240) if result.status != "done" else "",
+            "regressed": list(result.regressed) if result.regressed else [],
         })
         if result.status == "done":
             return None
