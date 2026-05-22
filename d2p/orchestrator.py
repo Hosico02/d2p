@@ -169,6 +169,7 @@ class Orchestrator:
         # Pool keeps running threads even after we stop caring about
         # their results; on orchestrator shutdown the daemon nature of
         # subprocess timeouts caps the leak.
+        self._current_iter: int = 0
         self._race_pool = cf.ThreadPoolExecutor(
             max_workers=max(2, self.cfg.parallel_executors * 2),
             thread_name_prefix="d2p-race",
@@ -228,6 +229,7 @@ class Orchestrator:
         always_min_features = 1        # P2: even under debt, always allow ≥1
         for it in range(resume_from_iter, self.cfg.max_iterations + 1):
             iter_started = time.monotonic()
+            self._current_iter = it
             log.info("=== iteration %d / %d ===", it, self.cfg.max_iterations)
 
             # Periodic re-analysis: refresh feature list mid-run, but preserve
@@ -280,6 +282,7 @@ class Orchestrator:
                 max_iter=self.cfg.max_iterations,
                 history=history, open_bugs=open_bugs,
                 feature_cap=feature_cap,
+                failed_attempts=self._load_failed_attempts_for_planner(),
             )
             stage_t["planner_s"] = round(time.monotonic() - _t, 1)
             self._dump(f"plan_iter{it}.json", plan.to_dict())
@@ -968,6 +971,11 @@ class Orchestrator:
 
             log.info("task %s [%s] -> %s (%d files)",
                      task.id, task.title[:60], res.status, len(res.files_changed))
+            if res.status != "done":
+                self._record_failed_task(
+                    task, res.error or "", iteration=self._current_iter,
+                    role=role,
+                )
             with results_lock:
                 results.append(res)
 
@@ -980,6 +988,72 @@ class Orchestrator:
     def _dump(self, name: str, payload: Any) -> None:
         path = self.run_dir / name
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    # ---- Failed-task ledger (C) -------------------------------------------
+    @property
+    def _failed_tasks_path(self) -> Path:
+        """Persistent across runs on the same project — lives at the .d2p
+        root, not under the per-run dir, so Planner sees prior runs' dead
+        ends too."""
+        return self.sandbox.root / ".d2p" / "failed_tasks.json"
+
+    def _record_failed_task(self, task: Task, error: str,
+                            *, iteration: int, role: str) -> None:
+        """Append a failure record. Dedupes nothing — read side aggregates.
+        Skips qa-* and restore-* (those are tracked via the bug ledger)."""
+        if task.id.startswith("qa-") or task.id.startswith("restore-"):
+            return
+        try:
+            rec = {
+                "title": task.title[:160],
+                "target_files": list(task.target_files),
+                "error": _flatten(error or "", 240),
+                "iteration": iteration,
+                "role": role,
+                "run_dir": self.run_dir.name,
+            }
+            path = self._failed_tasks_path
+            existing: list[dict[str, Any]] = []
+            if path.is_file():
+                try:
+                    existing = json.loads(path.read_text())
+                except Exception:
+                    existing = []
+            existing.append(rec)
+            # cap the file so it doesn't grow unbounded
+            existing = existing[-200:]
+            path.write_text(json.dumps(existing, ensure_ascii=False, indent=2))
+        except Exception as e:
+            log.warning("failed_tasks ledger write skipped: %s", e)
+
+    def _load_failed_attempts_for_planner(self) -> list[dict[str, Any]]:
+        """Return an aggregated list the Planner can reason about. Groups
+        by (title, target_files-tuple) so the planner sees "this exact task
+        signature failed N times" rather than N separate near-duplicates."""
+        path = self._failed_tasks_path
+        if not path.is_file():
+            return []
+        try:
+            raw = json.loads(path.read_text())
+        except Exception:
+            return []
+        groups: dict[tuple[str, tuple[str, ...]], dict[str, Any]] = {}
+        for rec in raw:
+            key = (str(rec.get("title", "")),
+                   tuple(rec.get("target_files") or []))
+            g = groups.get(key)
+            if g is None:
+                g = {
+                    "title": rec.get("title", ""),
+                    "target_files": list(rec.get("target_files") or []),
+                    "failed_count": 0,
+                    "last_error": rec.get("error", ""),
+                }
+                groups[key] = g
+            g["failed_count"] += 1
+            g["last_error"] = rec.get("error", g["last_error"])
+        # Sort by failed_count desc, cap at 20 so we don't bloat the prompt
+        return sorted(groups.values(), key=lambda g: -g["failed_count"])[:20]
 
     def _reload_history(self) -> tuple[list[dict[str, Any]], int, list[dict[str, Any]]]:
         """Rebuild orchestrator history from per-iter dumps on disk.
