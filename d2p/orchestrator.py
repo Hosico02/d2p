@@ -481,11 +481,27 @@ class Orchestrator:
                     # other reason) shouldn't count — otherwise the wontfix
                     # threshold trips on bugs we never actually tried to fix.
                     dispatched_test_paths = set(bug_test_paths.values())
-                    threshold = self.cfg.qa_wontfix_after_attempts
+                    base_threshold = self.cfg.qa_wontfix_after_attempts
+                    # Ladder-aware effective threshold: every non-top tier
+                    # gets 1 attempt; only the top tier gets `base_threshold`
+                    # attempts before retire. Total = (ladder_len - 1) +
+                    # base_threshold. For single-tier minimax (ladder_len=1)
+                    # this collapses to base_threshold (= 3 by default).
+                    fix_ladder_len = self.router.ladder_length("fix")
+                    top_tier = max(0, fix_ladder_len - 1)
+                    effective_threshold = (fix_ladder_len - 1) + base_threshold \
+                        if base_threshold else 0
                     survivors: list = []
                     for b in still_open:
                         if b.test_path in dispatched_test_paths:
                             n = self.qa.bump_attempts(b.test_path)
+                            # Bump tier_idx so the NEXT iter dispatches this
+                            # bug with the next-stronger model. No-op once
+                            # we've reached the top tier.
+                            if fix_ladder_len > 1:
+                                new_tier = self.qa.bump_tier(
+                                    b.test_path, top_tier=top_tier)
+                                b.tier_idx = new_tier
                         else:
                             # deferred: keep prior attempts unchanged. Read
                             # the current value so the threshold check below
@@ -494,14 +510,14 @@ class Orchestrator:
                             n = int(self.qa._load_meta()
                                        .get(b.test_path, {})
                                        .get("attempts", 0) or 0)
-                        if threshold and n >= threshold:
+                        if effective_threshold and n >= effective_threshold:
                             self.qa.mark_wontfix(b.test_path)
                             retired_this_iter.append(b.test_path)
                         else:
                             survivors.append(b)
                     if retired_this_iter:
                         log.info("Retired %d bug(s) as wontfix (attempts >= %d): %s",
-                                 len(retired_this_iter), threshold,
+                                 len(retired_this_iter), effective_threshold,
                                  retired_this_iter)
                     log.info("After fix+regression-sweep: %d bugs still open, %d retired",
                              len(survivors), len(retired_this_iter))

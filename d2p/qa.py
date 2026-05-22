@@ -69,6 +69,7 @@ class BugReport:
     status: str = "open"             # open | fixed | flaky | wontfix
     attempts: int = 0                # how many fix tasks the orchestrator ran
     first_seen_iter: int = 0         # iter where the bug was first discovered
+    tier_idx: int = 0                # ladder tier the next fix attempt uses
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -78,6 +79,7 @@ class BugReport:
             "last_failure": self.last_failure, "status": self.status,
             "attempts": self.attempts,
             "first_seen_iter": self.first_seen_iter,
+            "tier_idx": self.tier_idx,
         }
 
 
@@ -325,6 +327,7 @@ class QAAgent:
                     status=prior_status if prior_status == "wontfix" else "open",
                     attempts=int(meta.get("attempts", 0) or 0),
                     first_seen_iter=int(meta.get("first_seen_iter", 0) or 0) or iteration,
+                    tier_idx=int(meta.get("tier_idx", 0) or 0),
                 )
                 # Retired bugs stay in the corpus (so we'd notice if they
                 # accidentally turn green) but we don't ask executors to keep
@@ -523,6 +526,21 @@ class QAAgent:
                                json.dumps(prior, ensure_ascii=False, indent=2))
             return n
 
+    def bump_tier(self, test_path: str, *, top_tier: int) -> int:
+        """Bump tier_idx by 1, capped at top_tier. Returns the new tier_idx.
+        Used after a failed fix attempt so the next iter retries this bug
+        with the next-stronger model in the ladder."""
+        with self._meta_lock:
+            prior = self._load_meta()
+            if test_path not in prior:
+                return 0
+            cur = int(prior[test_path].get("tier_idx", 0) or 0)
+            new = min(cur + 1, top_tier)
+            prior[test_path]["tier_idx"] = new
+            self.sandbox.write(f"{self.corpus_dir}/_meta.json",
+                               json.dumps(prior, ensure_ascii=False, indent=2))
+            return new
+
     def mark_wontfix(self, test_path: str) -> None:
         """Retire a bug: keep the test in the corpus (so future runs notice
         if it goes green) but stop dispatching fix tasks for it."""
@@ -667,6 +685,7 @@ class QAAgent:
             priority=1,
             category="bugfix",
             forbidden_files=[bug.test_path],
+            tier_idx=bug.tier_idx,
         )
 
 
