@@ -147,7 +147,8 @@ class Executor:
 
     def __init__(self, llm: LLMProvider, sandbox: Sandbox,
                  adapter: Optional[LanguageAdapter] = None,
-                 usage: Any = None) -> None:
+                 usage: Any = None,
+                 heal_llm: Optional[LLMProvider] = None) -> None:
         self.llm = llm
         self.sandbox = sandbox
         self.adapter = adapter or adapter_for(detect_primary_language(sandbox))
@@ -156,6 +157,11 @@ class Executor:
         # up in summary.json. If None (legacy callers / tests), counters
         # are a no-op.
         self.usage = usage
+        # Optional stronger model for the 2nd self-heal attempt. The
+        # orchestrator passes router.for_role_tier(role, tier_idx + 1)
+        # when a next tier exists; None when this task is already at the
+        # top tier (in which case the 2nd attempt reuses self.llm).
+        self.heal_llm = heal_llm
 
     # ---- prepare/commit split -----------------------------------------------
     # The orchestrator calls `prepare` OUTSIDE the per-file lock (slow LLM
@@ -489,28 +495,75 @@ class Executor:
     # ---- self-heal -----------------------------------------------------------
 
     def _self_heal(self, rel: str, syntax_err: str, task: Task) -> bool:
-        """Ask the model to fix a syntax error in the file we just wrote.
-        Returns True if the heal succeeded (file now parses); False otherwise.
+        """Up to two attempts at fixing a syntax error in `rel`:
+          1. Same-tier (self.llm). Cheap, often enough.
+          2. Next-tier (self.heal_llm) when configured — typically the
+             orchestrator passes tier_idx+1's provider, so a haiku-induced
+             error gets a sonnet rescue, a sonnet-induced error gets opus.
+
+        Returns True iff the file parses cleanly after one of the attempts.
+        Failure-error from attempt 1 is fed back into attempt 2 so the
+        stronger model knows what specifically didn't work.
         """
-        if self.usage is not None:
-            self.usage.increment("self_heal_attempts")
         broken = self.sandbox.read(rel)
         if not broken or not rel.endswith(".py"):
             return False
+        # Attempt 1: same-tier.
+        if self._self_heal_one(rel, syntax_err, task, llm=self.llm,
+                               prior_failure=None):
+            return True
+        # Re-read the file — attempt 1 may have written something broken
+        # and then restored, OR left broken state if it never made it that
+        # far. Either way `broken` could be stale.
+        broken_after_1 = self.sandbox.read(rel)
+        cur_err_after_1 = _post_write_syntax_check(
+            self.sandbox, rel, self.adapter)
+        if not cur_err_after_1:
+            # somehow already healed (shouldn't happen — attempt 1 would
+            # have returned True). Safety: report success.
+            return True
+        # Attempt 2: escalate to heal_llm if available, else retry same tier
+        # with the attempt-1 failure error as additional context.
+        next_llm = self.heal_llm or self.llm
+        return self._self_heal_one(rel, cur_err_after_1, task, llm=next_llm,
+                                   prior_failure=syntax_err,
+                                   prior_state=broken_after_1)
+
+    def _self_heal_one(self, rel: str, syntax_err: str, task: Task, *,
+                       llm: LLMProvider,
+                       prior_failure: Optional[str] = None,
+                       prior_state: Optional[str] = None) -> bool:
+        """Single self-heal attempt with `llm`. Returns True iff the file
+        parses cleanly after the write.
+        """
+        if self.usage is not None:
+            self.usage.increment("self_heal_attempts")
+        broken = prior_state if prior_state is not None else self.sandbox.read(rel)
+        if not broken:
+            return False
         numbered = _with_line_numbers(broken)
+        prior_block = ""
+        if prior_failure:
+            prior_block = (
+                f"NOTE: A prior heal attempt also failed with: {prior_failure}\n"
+                f"Address that as well — do not reproduce the same broken "
+                f"indentation/structure.\n\n"
+            )
         user = (
             f"File: {rel}\n"
             f"Syntax error: {syntax_err}\n"
             f"Original task: {task.title}\n\n"
+            f"{prior_block}"
             f"Current (broken) contents with line numbers:\n{numbered}\n\n"
             f"Re-emit the entire file with the syntax fixed. Use:\n"
             f"===FILE: {rel}===\n<contents>\n===END===\n"
         )
         try:
-            raw = self.llm.chat(self.SELF_HEAL_SYS, user, temperature=0.1,
-                                max_tokens=16000)
+            raw = llm.chat(self.SELF_HEAL_SYS, user, temperature=0.1,
+                           max_tokens=16000)
         except Exception as e:
-            log.warning("self-heal LLM error on %s: %s", rel, e)
+            log.warning("self-heal LLM error on %s (using %s): %s",
+                        rel, getattr(llm, "name", "?"), e)
             return False
         parsed = parse_executor_output(raw)
         for path, content in parsed["files"]:
@@ -521,7 +574,8 @@ class Executor:
                 continue
             self.sandbox.write(rel, content)
             if not _post_write_syntax_check(self.sandbox, rel, self.adapter):
-                log.info("self-heal succeeded for %s", rel)
+                log.info("self-heal succeeded for %s (via %s)",
+                         rel, getattr(llm, "name", "?"))
                 if self.usage is not None:
                     self.usage.increment("self_heal_succeeded")
                 return True

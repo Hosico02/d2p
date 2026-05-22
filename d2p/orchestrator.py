@@ -928,6 +928,12 @@ class Orchestrator:
             primary_llm = self.router.for_role_tier(role, task.tier_idx)
             log.info("task %s tier=%d using %s",
                      task.id, task.tier_idx, primary_llm.name)
+            # Heal model = next tier when available, else same tier.
+            # _self_heal uses it for the 2nd-attempt syntax rescue. The
+            # task's persistent tier_idx is NOT bumped — this is local
+            # rescue, not a queue advancement.
+            heal_llm = (self.router.for_role_tier(role, task.tier_idx + 1)
+                        if task.tier_idx + 1 < ladder_len else None)
             if race_on and task.tier_idx + 1 < ladder_len:
                 # Race v2: kick off primary tier + next tier in parallel.
                 # Whichever finishes prepare first attempts commit; if the
@@ -936,9 +942,11 @@ class Orchestrator:
                 # max_fix_attempts=1.
                 next_llm = self.router.for_role_tier(role, task.tier_idx + 1)
                 primary_exec = Executor(primary_llm, self.sandbox,
-                                        usage=self.router.usage)
+                                        usage=self.router.usage,
+                                        heal_llm=heal_llm)
                 fb_executor = Executor(next_llm, self.sandbox,
-                                       usage=self.router.usage)
+                                       usage=self.router.usage,
+                                       heal_llm=heal_llm)
                 f_prim = self._race_pool.submit(primary_exec.prepare, task)
                 f_fb = self._race_pool.submit(fb_executor.prepare, task)
                 sides = {f_prim: ("primary", primary_exec),
@@ -971,11 +979,14 @@ class Orchestrator:
                     )
             else:
                 # Normal path: per-task fresh Executor at its current tier.
-                # No within-iter escalation — failed tasks get bumped by the
-                # carry-over queue and retried with the stronger tier model
-                # in the NEXT iter (replaces the old fallback path).
+                # No within-iter escalation for the task itself — failed
+                # tasks get bumped by the carry-over queue and retried with
+                # the stronger tier model in the NEXT iter. heal_llm gives
+                # the executor a same-batch rescue ONLY for syntax errors
+                # (cheap, surgical, doesn't change task tier).
                 primary_exec = Executor(primary_llm, self.sandbox,
-                                        usage=self.router.usage)
+                                        usage=self.router.usage,
+                                        heal_llm=heal_llm)
                 res, _snapshot = _attempt(task, primary_exec, pc)
 
             log.info("task %s [%s] -> %s (%d files)",
