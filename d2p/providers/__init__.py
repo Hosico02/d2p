@@ -87,14 +87,11 @@ class ProviderSpec:
     base_url: str = ""
     default_model: str = ""
     role_models: dict[str, str] = field(default_factory=dict)
-    # Optional escalation models: { "executor": "sonnet", "fix": "opus" }.
-    # Triggered by orchestrator when a task fails — retries once with the
-    # fallback model. Empty by default = no escalation.
-    fallback_models: dict[str, str] = field(default_factory=dict)
     # Per-role tier ladder: { "executor": ["haiku","sonnet","opus"], ... }.
     # Carry-over queue uses this to bump a failing task's tier_idx each
     # iter. Defaults from DEFAULT_LADDERS[kind]; env overrides via
-    # D2P_ROLE_<ROLE>_LADDER=a,b,c.
+    # D2P_ROLE_<ROLE>_LADDER=a,b,c. Replaces the old fallback_models /
+    # D2P_ROLE_<ROLE>_FALLBACK_MODEL within-iter escalation.
     role_ladders: dict[str, list[str]] = field(default_factory=dict)
 
 
@@ -123,17 +120,12 @@ def _from_env() -> ProviderSpec:
 
     # role overrides from env (D2P_ROLE_EXECUTOR_MODEL=...)
     overrides: dict[str, str] = {}
-    fallbacks: dict[str, str] = {}
     ladder_overrides: dict[str, list[str]] = {}
     for role in ("executor", "fix", "analyzer", "planner", "qa", "default"):
         env_name = f"D2P_ROLE_{role.upper()}_MODEL"
         v = os.environ.get(env_name)
         if v:
             overrides[role] = v
-        fb_env = f"D2P_ROLE_{role.upper()}_FALLBACK_MODEL"
-        fb = os.environ.get(fb_env)
-        if fb:
-            fallbacks[role] = fb
         ladder_env = f"D2P_ROLE_{role.upper()}_LADDER"
         ladder_v = os.environ.get(ladder_env)
         if ladder_v:
@@ -145,7 +137,7 @@ def _from_env() -> ProviderSpec:
     return ProviderSpec(
         kind=kind, api_key=key, base_url=base,
         default_model=default_model, role_models=role_models,
-        fallback_models=fallbacks, role_ladders=role_ladders,
+        role_ladders=role_ladders,
     )
 
 
@@ -207,17 +199,6 @@ def build_router(spec: ProviderSpec | None = None,
             s.kind, api_key=s.api_key, base_url=s.base_url, model=m, role=role,
             working_dir=working_dir, usage=usage,
         )
-    # Fallback providers (escalation on task failure). Constructed with a
-    # `<role>-fallback` role label so their usage records appear as a
-    # separate bucket in the cost summary — makes escalation visible.
-    fallbacks: dict[str, LLMProvider] = {}
-    for role, fb_model in s.fallback_models.items():
-        if role == "default":
-            continue
-        fallbacks[role] = _make_provider(
-            s.kind, api_key=s.api_key, base_url=s.base_url, model=fb_model,
-            role=f"{role}-fallback", working_dir=working_dir, usage=usage,
-        )
     # Tier ladders: one provider per (role, tier_idx). Each tier gets its
     # own role label `<role>-tier<idx>` so per-tier usage shows in the cost
     # summary — makes it visible how often we had to escalate.
@@ -232,8 +213,7 @@ def build_router(spec: ProviderSpec | None = None,
             )
             for idx, m in enumerate(ladder_models)
         ]
-    return RoleRouter(providers, usage=usage, fallbacks=fallbacks,
-                      ladders=ladders)
+    return RoleRouter(providers, usage=usage, ladders=ladders)
 
 
 __all__ = [

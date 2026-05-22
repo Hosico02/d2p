@@ -125,13 +125,6 @@ Open bug reports (failing QA tests from previous iterations):
 Previous iteration results (most recent first):
 {history}
 
-Previously failed task attempts (DO NOT re-propose the same scope — each
-entry includes a failed_count across prior runs and the last error. If
-failed_count >= 2, treat that task signature as INFEASIBLE for the
-current model: either skip it entirely, pick different target_files, or
-fundamentally change the approach):
-{failed_attempts}
-
 Iteration: {iteration} / {max_iter}
 
 Return a JSON object:
@@ -251,8 +244,7 @@ class Planner:
     def run(self, analysis: AnalysisReport, *, iteration: int, max_iter: int,
             history: list[dict[str, Any]],
             open_bugs: list[dict[str, Any]] | None = None,
-            feature_cap: int | None = None,
-            failed_attempts: list[dict[str, Any]] | None = None) -> PlanResult:
+            feature_cap: int | None = None) -> PlanResult:
         """Build the next plan. If `feature_cap` is set, the Planner is told
         to emit at most that many tasks — avoids the previous "Planner
         produces 5, orchestrator post-hoc trims to 1 under bug debt"
@@ -279,9 +271,6 @@ class Planner:
         # just the signal: iteration, what tasks ran, their status, what
         # bugs got found/fixed.
         compact_history = _compress_history(history[-3:]) if history else []
-        failed_block = _json.dumps(failed_attempts or [],
-                                   ensure_ascii=False, indent=2) \
-            if failed_attempts else "(none)"
         user = PLANNER_USER_TMPL.format(
             analysis=_json.dumps(analysis.to_dict(), ensure_ascii=False, indent=2),
             listing=listing_str,
@@ -289,7 +278,6 @@ class Planner:
             symbol_map=_json.dumps(symbol_map, ensure_ascii=False, indent=2),
             open_bugs=_json.dumps(open_bugs or [], ensure_ascii=False, indent=2),
             history=_json.dumps(compact_history, ensure_ascii=False, indent=2) if compact_history else "(none)",
-            failed_attempts=failed_block,
             iteration=iteration,
             max_iter=max_iter,
             min_tasks=plan_lo,
@@ -299,9 +287,13 @@ class Planner:
         # OpenAI). Falls back to chat_json with the schema appended to the
         # prompt otherwise (claude-cli, minimax) — same correctness, no
         # speed bonus.
+        # max_tokens bumped 4000→8000: late-iter prompts pack history +
+        # open_bugs + symbol_map + key_files, and the response JSON itself
+        # grows when the planner reasons about carry-over context. We hit
+        # truncation at 4000 once user-style runs got past iter ~8.
         data = chat_structured(self.llm, PLANNER_SYS, user,
                                schema=PLAN_SCHEMA,
-                               temperature=0.3, max_tokens=4000)
+                               temperature=0.3, max_tokens=8000)
         tasks = []
         for t in data.get("tasks", [])[:cap]:
             tasks.append(Task(

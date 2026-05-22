@@ -918,18 +918,8 @@ class TestAnalyzerCachedRoundtrip(unittest.TestCase):
             self.assertEqual(llm.chat_json.call_count, 6)
 
 
-class TestRouterFallback(unittest.TestCase):
-    def test_for_fallback_returns_none_when_absent(self) -> None:
-        from d2p.providers.base import RoleRouter
-
-        class P:
-            def __init__(self, n): self.name = n
-            def chat(self, *a, **k): return ""
-            def chat_json(self, *a, **k): return {}
-        r = RoleRouter({"default": P("d"), "executor": P("e")})
-        self.assertIsNone(r.for_fallback("executor"))
-
-    def test_for_fallback_returns_provider_when_set(self) -> None:
+class TestRouterLadder(unittest.TestCase):
+    def test_for_role_tier_no_ladder_falls_through(self) -> None:
         from d2p.providers.base import RoleRouter
 
         class P:
@@ -937,28 +927,46 @@ class TestRouterFallback(unittest.TestCase):
             def chat(self, *a, **k): return ""
             def chat_json(self, *a, **k): return {}
         primary = P("haiku")
-        fallback = P("sonnet")
-        r = RoleRouter({"default": primary, "executor": primary},
-                       fallbacks={"executor": fallback})
-        self.assertIs(r.for_fallback("executor"), fallback)
-        self.assertIsNone(r.for_fallback("planner"))
-        # describe() exposes the fallback under <role>-fallback
-        d = r.describe()
-        self.assertIn("executor-fallback", d)
-        self.assertEqual(d["executor-fallback"], "sonnet")
+        r = RoleRouter({"default": primary, "executor": primary})
+        # no ladder configured → falls back to for_role
+        self.assertIs(r.for_role_tier("executor", 0), primary)
+        self.assertIs(r.for_role_tier("executor", 5), primary)
+        self.assertEqual(r.ladder_length("executor"), 1)
 
-    def test_provider_spec_reads_fallback_env(self) -> None:
+    def test_for_role_tier_with_ladder(self) -> None:
+        from d2p.providers.base import RoleRouter
+
+        class P:
+            def __init__(self, n): self.name = n
+            def chat(self, *a, **k): return ""
+            def chat_json(self, *a, **k): return {}
+        p0, p1, p2 = P("haiku"), P("sonnet"), P("opus")
+        r = RoleRouter({"default": p0, "executor": p0},
+                       ladders={"executor": [p0, p1, p2]})
+        self.assertIs(r.for_role_tier("executor", 0), p0)
+        self.assertIs(r.for_role_tier("executor", 1), p1)
+        self.assertIs(r.for_role_tier("executor", 2), p2)
+        # clamps overshoot to top
+        self.assertIs(r.for_role_tier("executor", 99), p2)
+        self.assertEqual(r.ladder_length("executor"), 3)
+        # describe exposes ladder tiers
+        d = r.describe()
+        self.assertEqual(d["executor-tier0"], "haiku")
+        self.assertEqual(d["executor-tier1"], "sonnet")
+        self.assertEqual(d["executor-tier2"], "opus")
+
+    def test_provider_spec_reads_ladder_env(self) -> None:
         import os as _os
         from d2p.providers import _from_env
         old = _os.environ.copy()
         try:
             _os.environ["D2P_PROVIDER"] = "minimax"
             _os.environ["MINIMAX_API_KEY"] = "sk-cp-test"
-            _os.environ["D2P_ROLE_EXECUTOR_FALLBACK_MODEL"] = "MiniMax-strong"
-            _os.environ["D2P_ROLE_FIX_FALLBACK_MODEL"] = "MiniMax-strong"
+            _os.environ["D2P_ROLE_EXECUTOR_LADDER"] = "A, B ,C"
+            _os.environ["D2P_ROLE_FIX_LADDER"] = "X"
             spec = _from_env()
-            self.assertEqual(spec.fallback_models.get("executor"), "MiniMax-strong")
-            self.assertEqual(spec.fallback_models.get("fix"), "MiniMax-strong")
+            self.assertEqual(spec.role_ladders["executor"], ["A", "B", "C"])
+            self.assertEqual(spec.role_ladders["fix"], ["X"])
         finally:
             _os.environ.clear()
             _os.environ.update(old)
@@ -1030,33 +1038,6 @@ class TestQAFenceStripAndParse(unittest.TestCase):
         _path, _meta, body = parsed[0]
         self.assertNotIn("```", body)
         self.assertIn("import unittest", body)
-
-
-class TestEscalationDecision(unittest.TestCase):
-    def test_skip_on_forbidden(self) -> None:
-        from d2p.orchestrator import _should_escalate
-        self.assertFalse(_should_escalate(
-            "partial; rejected: tests/d2p_qa/x.py: forbidden (test file, read)"))
-
-    def test_skip_on_sandbox_escape(self) -> None:
-        from d2p.orchestrator import _should_escalate
-        self.assertFalse(_should_escalate("path escapes sandbox: ../etc/x"))
-
-    def test_retry_on_regression(self) -> None:
-        from d2p.orchestrator import _should_escalate
-        self.assertTrue(_should_escalate(
-            "regression detected — rolled back"))
-
-    def test_retry_on_search_miss(self) -> None:
-        from d2p.orchestrator import _should_escalate
-        self.assertTrue(_should_escalate(
-            "app.py: SEARCH not found after retry: '@app.route...'"))
-
-    def test_retry_on_empty_error(self) -> None:
-        from d2p.orchestrator import _should_escalate
-        # unknown errors should default to retry — better to waste $0.10
-        # on one extra call than to silently swallow a fixable case.
-        self.assertTrue(_should_escalate(""))
 
 
 class TestFlattenError(unittest.TestCase):

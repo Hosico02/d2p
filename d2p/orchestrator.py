@@ -58,33 +58,6 @@ def _discover_pre_existing_tests(sandbox: Sandbox) -> list[str]:
     return out
 
 
-# Error-message substrings that indicate a *structural* failure (executor
-# couldn't even attempt the work — wrong task framing, forbidden target,
-# empty plan, etc.). For these, retrying with a stronger model wastes
-# tokens because the constraint isn't model-quality.
-_STRUCTURAL_FAILURE_MARKERS = (
-    "forbidden (test file",   # tried to write a QA-protected test
-    "forbidden (",            # any forbidden_files violation
-    "no target files",        # empty plan output
-    "no ===FILE===",          # parser found zero blocks
-    "no ===PATCH===",
-    "path escapes sandbox",   # tried to write outside sandbox
-)
-
-
-def _should_escalate(error: str) -> bool:
-    """Decide whether a task failure is worth retrying with the fallback
-    model. Structural failures (forbidden file, wrong framing, sandbox
-    escape) won't fix themselves with a stronger model — skip the retry.
-    Everything else (regression rolled back, SEARCH miss, post-check fail,
-    syntax error, LLM hiccup) is worth one more shot.
-    """
-    if not error:
-        return True
-    e = error.lower()
-    return not any(marker in e for marker in _STRUCTURAL_FAILURE_MARKERS)
-
-
 def _flatten(msg: str, max_len: int = 200) -> str:
     """Single-line, length-capped form of an error string. Without flattening,
     a multi-line Traceback inside the log line shreds grep + monitor output

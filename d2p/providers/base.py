@@ -181,28 +181,26 @@ class RoleRouter:
     The router also owns a single UsageAccumulator shared by every provider it
     constructed (wiring happens in `build_router`).
 
-    Fallback providers
-    ------------------
-    Optional per-role fallbacks let the orchestrator retry a failed task with
-    a stronger model. Wired through D2P_ROLE_<ROLE>_FALLBACK_MODEL env, e.g.
-    `D2P_ROLE_EXECUTOR_FALLBACK_MODEL=sonnet`. Usage from fallback retries is
-    attributed under a `<role>-fallback` role label so cost breakdowns make
-    the escalation visible.
+    Tier ladders
+    ------------
+    Per-role ordered ladder of providers (tier 0 = cheap/fast primary,
+    tier N = strongest). The carry-over queue bumps a failing task's
+    tier_idx each iter; orchestrator dispatches per task at its current
+    tier via `for_role_tier`. Configure via DEFAULT_LADDERS or env
+    `D2P_ROLE_<ROLE>_LADDER=a,b,c`.
     """
 
     DEFAULT_ROLES = ("analyzer", "planner", "executor", "fix", "qa")
 
     def __init__(self, providers: dict[str, LLMProvider],
                  usage: UsageAccumulator | None = None,
-                 fallbacks: dict[str, LLMProvider] | None = None,
                  ladders: dict[str, list[LLMProvider]] | None = None) -> None:
         if not providers:
             raise ValueError("RoleRouter needs at least one provider")
         self._providers = dict(providers)
-        self._fallbacks: dict[str, LLMProvider] = dict(fallbacks or {})
         # role -> ordered ladder of providers; tier 0 = primary, tier N = strongest.
-        # Tasks that fail get re-queued for next iter at tier_idx+1 (executor.py
-        # owns the bump; orchestrator dispatches per task at its current tier).
+        # Tasks that fail get re-queued for next iter at tier_idx+1 (orchestrator
+        # owns the bump; dispatch picks the per-task tier).
         self._ladders: dict[str, list[LLMProvider]] = dict(ladders or {})
         # ensure every default role resolves: missing → fall back to 'default'
         if "default" not in self._providers:
@@ -211,10 +209,6 @@ class RoleRouter:
 
     def for_role(self, role: str) -> LLMProvider:
         return self._providers.get(role) or self._providers["default"]
-
-    def for_fallback(self, role: str) -> LLMProvider | None:
-        """Return the role's escalation provider if configured, else None."""
-        return self._fallbacks.get(role)
 
     def for_role_tier(self, role: str, tier_idx: int) -> LLMProvider:
         """Return the provider at `tier_idx` of `role`'s ladder. If no ladder
@@ -236,12 +230,9 @@ class RoleRouter:
 
     def describe(self) -> dict[str, str]:
         """{role: provider.name} — useful for logging the active routing.
-        Fallback roles appear as `<role>-fallback`. Ladder roles appear as
-        `<role>-tier<N>`."""
+        Ladder roles appear as `<role>-tier<N>`."""
         out = {role: self._providers.get(role, self._providers["default"]).name
                for role in set(list(self._providers.keys()) + list(self.DEFAULT_ROLES))}
-        for role, fp in self._fallbacks.items():
-            out[f"{role}-fallback"] = fp.name
         for role, ladder in self._ladders.items():
             for i, p in enumerate(ladder):
                 out[f"{role}-tier{i}"] = p.name
