@@ -232,7 +232,10 @@ class Orchestrator:
 
     def run(self) -> dict[str, Any]:
         run_started = time.monotonic()
-        run_id = str(uuid.uuid4())
+        # Honor D2P_RUN_ID if Hub pre-generated it (so Hub's RunSupervisor
+        # and d2p agree on the row identifier before run_started is pushed).
+        # Falls back to a fresh uuid for standalone runs.
+        run_id = os.environ.get("D2P_RUN_ID") or str(uuid.uuid4())
         log.info("d2p starting on %s", self.sandbox.root)
         if self.hub:
             try:
