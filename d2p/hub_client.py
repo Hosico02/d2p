@@ -35,7 +35,11 @@ class HubClient:
         if etag:
             headers["If-None-Match"] = etag
         try:
-            with httpx.Client(timeout=5.0) as client:
+            # trust_env=False: ignore HTTP_PROXY / system proxy settings.
+            # The Hub is typically on a private LAN or 127.0.0.1; routing
+            # through a user's outbound proxy (Clash, Surge, corp proxy)
+            # produces opaque 502s. Hub is also explicitly internal.
+            with httpx.Client(timeout=5.0, trust_env=False) as client:
                 resp = client.get(f"{self.base}/api/standards/{archetype}",
                                   headers=headers)
             if resp.status_code == 304:
@@ -81,7 +85,7 @@ class HubClient:
 
         unsent: list[dict[str, t.Any]] = []
         try:
-            with httpx.Client(timeout=5.0) as client:
+            with httpx.Client(timeout=5.0, trust_env=False) as client:
                 for evt in events_to_send:
                     try:
                         resp = client.post(
