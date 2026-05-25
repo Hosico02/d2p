@@ -191,7 +191,7 @@ Symbol map:
 Already-existing QA tests (do NOT duplicate these):
 {existing_tests}
 
-Emit 2-4 new test blocks. Each must be likely to FAIL on the current code.
+Emit one test per failing-bug hypothesis you can construct (typical 3-10). Do NOT pad and do NOT artificially limit yourself on the upper end — if you spot 8 distinct hypotheses, emit 8 tests. SOFT FLOOR: emit AT LEAST 2 tests unless you have audited the codebase end-to-end and are convinced no bug exists; on a fresh codebase you have not seen before, there are always at least 2 credible hypotheses (e.g. missing input validation, missing auth, race conditions, error paths). Each test must be likely to FAIL on the current code.
 """
 
 

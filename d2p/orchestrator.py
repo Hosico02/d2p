@@ -7,6 +7,7 @@ import uuid
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, cast
@@ -156,8 +157,10 @@ class Orchestrator:
                  enable_qa: bool = True,
                  use_analyzer_cache: bool = True,
                  resume_from: str | Path | None = None,
-                 router: RoleRouter | None = None) -> None:
+                 router: RoleRouter | None = None,
+                 hub_client: Any | None = None) -> None:
         self.cfg = cfg or Config()
+        self.hub = hub_client
         if parallel is not None:
             self.cfg.parallel_executors = parallel
         if max_iterations is not None:
@@ -214,7 +217,16 @@ class Orchestrator:
 
     def run(self) -> dict[str, Any]:
         run_started = time.monotonic()
+        run_id = str(uuid.uuid4())
         log.info("d2p starting on %s", self.sandbox.root)
+        if self.hub:
+            try:
+                self.hub.push_event("run_started", run_id, {
+                    "project_path": str(self.sandbox.root),
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception:
+                pass
         # Persistent analyzer cache keyed by codebase fingerprint. Lives
         # alongside the target's .d2p dir but OUTSIDE this run's dir, so
         # subsequent runs against the same demo skip the (slow + costly)
@@ -260,8 +272,8 @@ class Orchestrator:
         # from per-call records).
         last_cost = self.router.usage.summary()["total_cost_usd"]
 
-        bug_debt_threshold = 12        # P2: raised from 6 → 12
-        always_min_features = 1        # P2: even under debt, always allow ≥1
+        bug_debt_threshold = 999       # disabled: user-policy "no artificial caps"
+        always_min_features = 1        # kept for safety if threshold ever re-armed
         for it in range(resume_from_iter, self.cfg.max_iterations + 1):
             iter_started = time.monotonic()
             self._current_iter = it
@@ -592,6 +604,15 @@ class Orchestrator:
                 stage_timings=stage_t,
             )
 
+            if self.hub:
+                try:
+                    self.hub.push_event("iteration_complete", run_id, {
+                        "iter_n": it,
+                        "ended_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                except Exception:
+                    pass
+
             # Convergence: stop iterating when NEITHER side made forward
             # progress. Previous check only looked at "no fix tasks ran",
             # which kept burning iters when fixes ran but all failed.
@@ -640,6 +661,16 @@ class Orchestrator:
         # Drain any outstanding bg prefetch — its result is now useless,
         # but the thread should exit cleanly before we return.
         self._bg_pool.shutdown(wait=False, cancel_futures=True)
+        if self.hub:
+            try:
+                terminal_state = "complete"
+                self.hub.push_event("run_terminated", run_id, {
+                    "terminal_state": terminal_state,
+                    "terminated_at": datetime.now(timezone.utc).isoformat(),
+                    "total_iterations": len(history),
+                })
+            except Exception:
+                pass
         return summary
 
     # ---------------------------------------------------------------- internal
@@ -841,7 +872,6 @@ class Orchestrator:
           don't serialise parallel tasks targeting different files.
         - Default parallel_executors bumped to 4.
         """
-        max_workers = max(1, min(self.cfg.parallel_executors, len(tasks)))
         ladder_len = self.router.ladder_length(role)
         # Log the routing for this batch — each tier shows up as a separate
         # provider, so users can see what's actually going to be dispatched.
@@ -1060,10 +1090,26 @@ class Orchestrator:
             with results_lock:
                 results.append(res)
 
-        with cf.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futs = [pool.submit(_run, i, t) for i, t in enumerate(ordered)]
-            for f in cf.as_completed(futs):
-                f.result()
+        # Priority waves: tasks with the same `priority` value run in
+        # parallel; the next priority bucket only starts after the current
+        # one fully drains. The Planner uses priority to encode
+        # producer→consumer dependencies (HARD RULE 6 in PLANNER_SYS), so
+        # this is what makes those dependencies actually take effect at
+        # dispatch time. Previously the pool drained all priorities at once
+        # and consumers raced their producers — see 2026-05-25 1-iter test
+        # (3/17 done with single-file split because deps never landed).
+        waves: dict[int, list[Task]] = defaultdict(list)
+        for t in ordered:
+            waves[t.priority].append(t)
+        for prio in sorted(waves.keys()):
+            group = waves[prio]
+            workers = max(1, min(self.cfg.parallel_executors, len(group)))
+            log.info("Priority wave %d: %d task(s), parallel=%d",
+                     prio, len(group), workers)
+            with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = [pool.submit(_run, i, t) for i, t in enumerate(group)]
+                for f in cf.as_completed(futs):
+                    f.result()
         return results
 
     def _dump(self, name: str, payload: Any) -> None:

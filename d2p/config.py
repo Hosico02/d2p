@@ -67,6 +67,8 @@ class Config:
     # CLI accepts: --race-mode (no arg = all), --race-mode fix,
     # --race-mode executor, --race-mode fix,executor, --race-mode none.
     race_roles: set[str] = field(default_factory=set)
+    hub_url: str | None = field(default_factory=lambda: os.environ.get("HUB_URL"))
+    hub_token: str | None = field(default_factory=lambda: os.environ.get("HUB_TOKEN"))
 
     def require_key(self) -> None:
         if not self.api_key:

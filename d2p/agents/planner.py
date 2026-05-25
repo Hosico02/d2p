@@ -100,9 +100,29 @@ HARD RULES (in priority order):
    the Executor can pin the patch site instead of guessing. Without this,
    patches against large files fail ~30% of the time on the primary model.
 
+6. PRIORITY ENCODES DEPENDENCIES. The orchestrator runs tasks in waves
+   grouped by `priority`: ALL priority-1 tasks finish before ANY priority-2
+   task starts; priority-2 finish before priority-3; etc. Within a single
+   priority value, tasks run in parallel and MUST be independent of each
+   other.
+
+   Use priority deliberately to encode producer→consumer ordering. Examples:
+     - "Wire post-game recap" needs game.py to expose `generate_recap()`
+       before app.py can call it; if you emit both as separate tasks, give
+       the game.py task `priority: 1` and the app.py task `priority: 2`.
+     - Independent UI polish tasks that touch unrelated templates can share
+       `priority: 5` and run in parallel.
+
+   Lower priority value = runs sooner. If two tasks touch the same file or
+   one's instructions reference a symbol the other creates, they MUST have
+   different priority values, with the producer numerically lower. If the
+   tasks are independent, you may give them the same priority value to let
+   them run in parallel.
+
 Decide the next concrete, file-level tasks. Prefer SMALL, INDEPENDENT tasks
-that can run in parallel. For large existing files, instruct the executor to
-use Mode B (SEARCH/REPLACE patches), not full rewrite.
+that can run in parallel within their priority wave. For large existing
+files, instruct the executor to use Mode B (SEARCH/REPLACE patches), not
+full rewrite.
 
 Output STRICT JSON only.
 """
@@ -142,9 +162,10 @@ Return a JSON object:
   ]
 }}
 Constraints:
-- {min_tasks} to {max_tasks} tasks.
+- Emit one task per actionable feature gap from the Analyzer report — typical range {min_tasks}-{max_tasks}, but do NOT pad and do NOT artificially limit yourself. If the Analyzer surfaces 12 gaps that should ship now, emit 12 tasks. If only 3 are real, emit 3.
 - Every task instruction must restate which aspect of `essence` it preserves.
 - target_files must be paths inside the project. Use new paths for new files.
+- priority encodes wave ordering (see HARD RULE 6): producers numerically lower than consumers; independents may share a priority.
 - Mention specific existing symbols you want to extend (e.g. "extend GameMaster.vote_phase").
 - For files > 200 lines, instructions must say "use Mode B SEARCH/REPLACE".
 - If there are open bug reports, the highest-priority task MUST be fixing one of them.
@@ -202,7 +223,7 @@ class Planner:
     )
 
     def __init__(self, llm: LLMProvider, sandbox: Sandbox, *,
-                 max_tasks: int = 5) -> None:
+                 max_tasks: int = 50) -> None:
         self.llm = llm
         self.sandbox = sandbox
         self.max_tasks = max_tasks
