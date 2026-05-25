@@ -69,6 +69,18 @@ class Config:
     race_roles: set[str] = field(default_factory=set)
     hub_url: str | None = field(default_factory=lambda: os.environ.get("HUB_URL"))
     hub_token: str | None = field(default_factory=lambda: os.environ.get("HUB_TOKEN"))
+    # Adversarial verifier (an independent Opus-class call after each iter's
+    # QA fix sweep). Runs the fixed-point convergence state machine — loop
+    # terminates after 2 consecutive `no_new_findings` passes, OR on a
+    # blocking `fail`, OR when max_iterations hits. Opt-in via env to keep
+    # existing runs unchanged until calibration shows verify is worth its
+    # +25% per-iter cost. See
+    # ../demo2project/docs/superpowers/specs/2026-05-22-d2p-verify-agent-design.md
+    verify_enabled: bool = field(default_factory=lambda: os.environ.get(
+        "D2P_VERIFY_ENABLED", "").lower() in {"1", "true", "yes", "on"})
+    # Streak length required for clean convergence. Default 2 per the spec
+    # (1 is noise-vulnerable, 3 is overkill).
+    verify_streak_required: int = 2
 
     def require_key(self) -> None:
         if not self.api_key:

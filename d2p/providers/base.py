@@ -190,7 +190,7 @@ class RoleRouter:
     `D2P_ROLE_<ROLE>_LADDER=a,b,c`.
     """
 
-    DEFAULT_ROLES = ("analyzer", "planner", "executor", "fix", "qa")
+    DEFAULT_ROLES = ("analyzer", "planner", "executor", "fix", "qa", "verify")
 
     def __init__(self, providers: dict[str, LLMProvider],
                  usage: UsageAccumulator | None = None,

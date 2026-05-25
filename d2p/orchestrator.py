@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import json
+import os
+import shutil
+import subprocess
 import uuid
 import logging
 import threading
@@ -13,6 +16,9 @@ from pathlib import Path
 from typing import Any, cast
 
 from .agents import Analyzer, Executor, Planner
+from .agents.verifier import (
+    PreEvidence, VerifyClaim, VerifyResult, Verifier,
+)
 from .config import Config
 from .fs import Sandbox
 from .health import ProjectHealth
@@ -180,6 +186,15 @@ class Orchestrator:
         # so they pick up the latest "executor" provider binding.
         self.qa = (QAAgent(self.router.for_role("qa"), self.sandbox)
                    if enable_qa else None)
+        # Adversarial verifier — opt-in via cfg.verify_enabled (env
+        # D2P_VERIFY_ENABLED). Holds previous_results in an instance list
+        # so each pass can classify findings as new vs repeated against
+        # the run's accumulated verify history.
+        self.verifier = (Verifier(self.router.for_role("verify"), self.sandbox)
+                         if self.cfg.verify_enabled else None)
+        self._verify_results_this_run: list[VerifyResult] = []
+        self._verify_streak: int = 0
+        self._verify_terminal_state: str | None = None
         self.health = ProjectHealth(self.sandbox)
         # Resume from a prior run_dir vs start a fresh one. On resume, we
         # reuse the existing dir (so per-iter JSON dumps accumulate) and
@@ -613,10 +628,84 @@ class Orchestrator:
                 except Exception:
                     pass
 
+            # Adversarial verifier (opt-in, gated by cfg.verify_enabled).
+            # Drives fixed-point convergence: terminate after `streak_required`
+            # consecutive "no new findings" passes, OR on a fail blocker, OR
+            # via the legacy zero-progress fallback below.
+            if self.verifier is not None:
+                _t = time.monotonic()
+                pre_evidence = self._collect_pre_evidence(iter_count=it)
+                claim = VerifyClaim(
+                    iter_count=it,
+                    no_more_features=(done == 0 and not next_queue),
+                    no_more_bugs=(len(open_bugs) == 0),
+                    qa_corpus_green=(qa_report is None
+                                     or len(qa_report.open_bugs) == 0),
+                )
+                result = self.verifier.verify(
+                    claim, pre_evidence,
+                    previous_results=list(self._verify_results_this_run),
+                )
+                stage_t["verify_s"] = round(time.monotonic() - _t, 1)
+                self._verify_results_this_run.append(result)
+                self._dump(f"verify_iter{it}.json", {
+                    "iter": it,
+                    "called_at": datetime.now(timezone.utc).isoformat(),
+                    "claim": claim.to_dict(),
+                    "pre_evidence": pre_evidence.to_dict(),
+                    "result": result.to_dict(),
+                    "elapsed_s": stage_t["verify_s"],
+                })
+                log.info("Verify iter %d: verdict=%s stability=%s new=%d repeated=%d",
+                         it, result.verdict, result.stability_signal,
+                         len(result.new_finding_categories),
+                         len(result.repeated_finding_categories))
+
+                # Fail = escalate immediately; bypass streak logic.
+                if result.verdict == "fail":
+                    self._verify_terminal_state = "TERMINATE_ESCALATED"
+                    self._write_handoff_report(
+                        result.blocking_findings,
+                        reason="blocker_found",
+                    )
+                    log.info("Verify: TERMINATE_ESCALATED — blocker found at iter %d", it)
+                    break
+
+                # Streak management. `pass` and `no_new_findings` both count
+                # as "verifier produced nothing new". `needs_repair` with
+                # empty new_finding_categories (only repeated remain) also
+                # counts — d2p has hit a fixed point with unresolved residuals
+                # the verifier keeps surfacing.
+                if (len(result.new_finding_categories) == 0
+                        or result.verdict == "no_new_findings"):
+                    self._verify_streak += 1
+                else:
+                    self._verify_streak = 0
+
+                if self._verify_streak >= self.cfg.verify_streak_required:
+                    if (result.verdict == "pass"
+                            and not result.repeated_finding_categories):
+                        self._verify_terminal_state = "TERMINATE_CLEAN"
+                        log.info("Verify: TERMINATE_CLEAN — converged at iter %d "
+                                 "after %d consecutive no-new-findings passes",
+                                 it, self._verify_streak)
+                    else:
+                        self._verify_terminal_state = "TERMINATE_WITH_RESIDUALS"
+                        self._write_handoff_report(
+                            result.repeated_finding_categories,
+                            reason="converged_with_residuals",
+                        )
+                        log.info("Verify: TERMINATE_WITH_RESIDUALS — converged at "
+                                 "iter %d with %d residual findings",
+                                 it, len(result.repeated_finding_categories))
+                    break
+
             # Convergence: stop iterating when NEITHER side made forward
             # progress. Previous check only looked at "no fix tasks ran",
             # which kept burning iters when fixes ran but all failed.
-            if done == 0 and done_fixes == 0:
+            # When verify is enabled it owns termination; this legacy check
+            # only fires when verify is disabled.
+            if self.verifier is None and done == 0 and done_fixes == 0:
                 log.info("Converged: iter %d had 0 feature wins and 0 fix wins.",
                          it)
                 break
@@ -644,6 +733,12 @@ class Orchestrator:
             "analyzer_elapsed_s": analyzer_elapsed,
             "analyzer_cache_hit": hit,
             "usage": self.router.usage.summary(),
+            "verify": {
+                "enabled": self.verifier is not None,
+                "terminal_state": self._verify_terminal_state,
+                "passes": [r.to_dict() for r in self._verify_results_this_run],
+                "streak_at_end": self._verify_streak,
+            },
         }
         self._dump("summary.json", summary)
         # Render a self-contained HTML report alongside the JSON dump.
@@ -674,6 +769,134 @@ class Orchestrator:
         return summary
 
     # ---------------------------------------------------------------- internal
+
+    # ---- verify helpers -------------------------------------------------- #
+
+    # Per-command timeout when running test/build/typecheck for pre-evidence.
+    # 90s strikes a balance — long enough for medium pytest suites, short
+    # enough that a hung command doesn't gate verify forever.
+    _PRE_EVIDENCE_TIMEOUT_S = 90
+
+    def _collect_pre_evidence(self, *, iter_count: int) -> PreEvidence:
+        """Run tests / build / typecheck / git-diff and bundle outputs.
+        Verifier never invokes execution itself — d2p does it and hands
+        the verifier the evidence."""
+        root = str(self.sandbox.root)
+        listing = set(self.sandbox.listing(max_entries=400))
+        is_python = ("pyproject.toml" in listing or "setup.py" in listing
+                     or "requirements.txt" in listing
+                     or any(p.endswith(".py") for p in listing))
+        is_node = "package.json" in listing
+        is_rust = "Cargo.toml" in listing
+        is_go = "go.mod" in listing
+
+        evidence = PreEvidence()
+
+        # Tests
+        test_cmd = None
+        if is_python and shutil.which("pytest"):
+            test_cmd = ["pytest", "-q", "--maxfail=20"]
+        elif is_node:
+            mgr = "pnpm" if "pnpm-lock.yaml" in listing else "npm"
+            if shutil.which(mgr):
+                test_cmd = [mgr, "test", "--silent"] if mgr == "npm" else [mgr, "test"]
+        elif is_rust and shutil.which("cargo"):
+            test_cmd = ["cargo", "test", "--quiet"]
+        elif is_go and shutil.which("go"):
+            test_cmd = ["go", "test", "./..."]
+        if test_cmd:
+            evidence.test_output, evidence.test_exit_code = self._run_cmd(
+                test_cmd, cwd=root)
+
+        # Build
+        build_cmd = None
+        if is_node and shutil.which("pnpm" if "pnpm-lock.yaml" in listing else "npm"):
+            mgr = "pnpm" if "pnpm-lock.yaml" in listing else "npm"
+            # Probe package.json for a build script before invoking.
+            pkg_txt = self.sandbox.read("package.json")
+            if pkg_txt and '"build"' in pkg_txt:
+                build_cmd = [mgr, "run", "build"]
+        elif is_rust and shutil.which("cargo"):
+            build_cmd = ["cargo", "build", "--quiet"]
+        elif is_go and shutil.which("go"):
+            build_cmd = ["go", "build", "./..."]
+        if build_cmd:
+            evidence.build_output, evidence.build_exit_code = self._run_cmd(
+                build_cmd, cwd=root)
+
+        # Typecheck
+        typecheck_cmd = None
+        if is_python and shutil.which("mypy"):
+            typecheck_cmd = ["mypy", "--ignore-missing-imports",
+                             "--no-error-summary", "."]
+        elif is_node and "tsconfig.json" in listing:
+            mgr = "pnpm" if "pnpm-lock.yaml" in listing else "npx"
+            if shutil.which(mgr):
+                typecheck_cmd = [mgr, "tsc", "--noEmit"]
+        if typecheck_cmd:
+            evidence.typecheck_output, evidence.typecheck_exit_code = (
+                self._run_cmd(typecheck_cmd, cwd=root))
+
+        # Git diff: only meaningful if target is a git repo.
+        if (Path(root) / ".git").is_dir() and shutil.which("git"):
+            # iter_count is iterations executed this run. Walk back that
+            # many commits if available; fall back to HEAD diff if not.
+            n = max(1, iter_count)
+            out, code = self._run_cmd(
+                ["git", "diff", f"HEAD~{n}..HEAD"], cwd=root)
+            if code != 0:
+                # Not enough history — fall back to working-tree diff.
+                out, _ = self._run_cmd(["git", "diff", "HEAD"], cwd=root)
+            evidence.git_diff_recent = out
+
+        return evidence
+
+    def _run_cmd(self, cmd: list[str], *, cwd: str) -> tuple[str, int]:
+        """Run a command with a hard timeout. Returns (combined_output, exit_code).
+        Exit code 124 used for timeout (matching `timeout(1)` convention).
+        Never raises — the verifier needs to see whatever happened, even if
+        the command didn't exist or hung."""
+        try:
+            p = subprocess.run(
+                cmd, cwd=cwd, capture_output=True, text=True,
+                timeout=self._PRE_EVIDENCE_TIMEOUT_S,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            )
+            return ((p.stdout + ("\n" + p.stderr if p.stderr else "")).rstrip(),
+                    int(p.returncode))
+        except subprocess.TimeoutExpired as e:
+            return (f"<timed out after {self._PRE_EVIDENCE_TIMEOUT_S}s: "
+                    f"{' '.join(cmd)}>\n{(e.stdout or b'').decode(errors='replace')}",
+                    124)
+        except FileNotFoundError:
+            return (f"<command not found: {cmd[0]}>", 127)
+        except Exception as e:
+            return (f"<unexpected error running {cmd!r}: "
+                    f"{type(e).__name__}: {e}>", 1)
+
+    def _write_handoff_report(self, findings, *, reason: str) -> None:
+        """Persist a human-readable handoff for TERMINATE_WITH_RESIDUALS or
+        TERMINATE_ESCALATED. Lives alongside verify_iter<N>.json in run_dir."""
+        path = self.run_dir / "verify_handoff.md"
+        lines = [f"# Verify handoff ({reason})", "",
+                 f"Terminated at iter {self._current_iter}.", ""]
+        if not findings:
+            lines.append("_(no findings recorded)_")
+        else:
+            for f in findings:
+                lines.append(f"## {f.category} ({f.severity})")
+                lines.append(f.message or "(no message)")
+                lines.append("")
+                if f.evidence:
+                    lines.append("Evidence:")
+                    lines.append("```")
+                    lines.append(f.evidence)
+                    lines.append("```")
+                lines.append("")
+        try:
+            path.write_text("\n".join(lines), encoding="utf-8")
+        except OSError as e:
+            log.warning("verify handoff write failed: %s", e)
 
     def _run_qa(self, analysis, *, iteration: int) -> tuple[Any, list[Task]]:
         assert self.qa is not None, "_run_qa called with QA disabled"

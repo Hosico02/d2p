@@ -54,6 +54,7 @@ DEFAULT_ROLE_MODELS: dict[str, dict[str, str]] = {
         "analyzer":  "claude-opus-4-7",
         "planner":   "claude-opus-4-7",
         "qa":        "claude-opus-4-7",
+        "verify":    "claude-opus-4-7",        # independent adversarial verify call
         "default":   "claude-haiku-4-5",
     },
     "codex": {
@@ -62,6 +63,7 @@ DEFAULT_ROLE_MODELS: dict[str, dict[str, str]] = {
         "analyzer":  "gpt-4o",
         "planner":   "gpt-4o",
         "qa":        "gpt-4o",
+        "verify":    "gpt-4o",
         "default":   "gpt-4o-mini",
     },
     "minimax": {
@@ -74,6 +76,7 @@ DEFAULT_ROLE_MODELS: dict[str, dict[str, str]] = {
         "analyzer":  "opus",
         "planner":   "opus",
         "qa":        "opus",
+        "verify":    "opus",
         "default":   "haiku",
     },
 }
@@ -121,7 +124,8 @@ def _from_env() -> ProviderSpec:
     # role overrides from env (D2P_ROLE_EXECUTOR_MODEL=...)
     overrides: dict[str, str] = {}
     ladder_overrides: dict[str, list[str]] = {}
-    for role in ("executor", "fix", "analyzer", "planner", "qa", "default"):
+    for role in ("executor", "fix", "analyzer", "planner", "qa", "verify",
+                 "default"):
         env_name = f"D2P_ROLE_{role.upper()}_MODEL"
         v = os.environ.get(env_name)
         if v:
@@ -184,7 +188,7 @@ def build_router(spec: ProviderSpec | None = None,
         model=s.role_models.get("default", s.default_model), role="default",
         working_dir=working_dir, usage=usage,
     )
-    for role in ("executor", "fix", "analyzer", "planner", "qa"):
+    for role in ("executor", "fix", "analyzer", "planner", "qa", "verify"):
         m = s.role_models.get(role, s.default_model)
         if m == s.role_models.get("default", s.default_model):
             # Share the default provider — BUT a single provider instance has
