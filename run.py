@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import pathlib
 import sys
 
 from d2p.config import Config
+from d2p.hub_client import HubClient
 from d2p.orchestrator import Orchestrator
 
 
@@ -86,10 +88,20 @@ def main(argv: list[str] | None = None) -> int:
     cfg.qa_wontfix_after_attempts = args.qa_wontfix_after
     cfg.max_concurrent_fixes = args.max_concurrent_fixes
     cfg.race_roles = _parse_race_roles(args.race_mode)
+
+    hub_client = None
+    if cfg.hub_url and cfg.hub_token:
+        hub_client = HubClient(
+            base_url=cfg.hub_url,
+            token=cfg.hub_token,
+            cache_dir=pathlib.Path.home() / ".d2p",
+        )
+
     orch = Orchestrator(args.target, cfg=cfg, max_iterations=args.iter,
                         parallel=args.parallel, enable_qa=not args.no_qa,
                         use_analyzer_cache=not args.no_cache_analysis,
-                        resume_from=args.resume)
+                        resume_from=args.resume,
+                        hub_client=hub_client)
     orch.run()
     return 0
 

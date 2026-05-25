@@ -7,6 +7,7 @@ import uuid
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, cast
@@ -156,8 +157,10 @@ class Orchestrator:
                  enable_qa: bool = True,
                  use_analyzer_cache: bool = True,
                  resume_from: str | Path | None = None,
-                 router: RoleRouter | None = None) -> None:
+                 router: RoleRouter | None = None,
+                 hub_client: Any | None = None) -> None:
         self.cfg = cfg or Config()
+        self.hub = hub_client
         if parallel is not None:
             self.cfg.parallel_executors = parallel
         if max_iterations is not None:
@@ -214,7 +217,16 @@ class Orchestrator:
 
     def run(self) -> dict[str, Any]:
         run_started = time.monotonic()
+        run_id = str(uuid.uuid4())
         log.info("d2p starting on %s", self.sandbox.root)
+        if self.hub:
+            try:
+                self.hub.push_event("run_started", run_id, {
+                    "project_path": str(self.sandbox.root),
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception:
+                pass
         # Persistent analyzer cache keyed by codebase fingerprint. Lives
         # alongside the target's .d2p dir but OUTSIDE this run's dir, so
         # subsequent runs against the same demo skip the (slow + costly)
@@ -260,8 +272,8 @@ class Orchestrator:
         # from per-call records).
         last_cost = self.router.usage.summary()["total_cost_usd"]
 
-        bug_debt_threshold = 12        # P2: raised from 6 → 12
-        always_min_features = 1        # P2: even under debt, always allow ≥1
+        bug_debt_threshold = 999       # disabled: user-policy "no artificial caps"
+        always_min_features = 1        # kept for safety if threshold ever re-armed
         for it in range(resume_from_iter, self.cfg.max_iterations + 1):
             iter_started = time.monotonic()
             self._current_iter = it
@@ -592,6 +604,15 @@ class Orchestrator:
                 stage_timings=stage_t,
             )
 
+            if self.hub:
+                try:
+                    self.hub.push_event("iteration_complete", run_id, {
+                        "iter_n": it,
+                        "ended_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                except Exception:
+                    pass
+
             # Convergence: stop iterating when NEITHER side made forward
             # progress. Previous check only looked at "no fix tasks ran",
             # which kept burning iters when fixes ran but all failed.
@@ -640,6 +661,16 @@ class Orchestrator:
         # Drain any outstanding bg prefetch — its result is now useless,
         # but the thread should exit cleanly before we return.
         self._bg_pool.shutdown(wait=False, cancel_futures=True)
+        if self.hub:
+            try:
+                terminal_state = "complete"
+                self.hub.push_event("run_terminated", run_id, {
+                    "terminal_state": terminal_state,
+                    "terminated_at": datetime.now(timezone.utc).isoformat(),
+                    "total_iterations": len(history),
+                })
+            except Exception:
+                pass
         return summary
 
     # ---------------------------------------------------------------- internal
