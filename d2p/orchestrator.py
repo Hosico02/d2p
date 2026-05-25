@@ -872,7 +872,6 @@ class Orchestrator:
           don't serialise parallel tasks targeting different files.
         - Default parallel_executors bumped to 4.
         """
-        max_workers = max(1, min(self.cfg.parallel_executors, len(tasks)))
         ladder_len = self.router.ladder_length(role)
         # Log the routing for this batch — each tier shows up as a separate
         # provider, so users can see what's actually going to be dispatched.
@@ -1091,10 +1090,26 @@ class Orchestrator:
             with results_lock:
                 results.append(res)
 
-        with cf.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futs = [pool.submit(_run, i, t) for i, t in enumerate(ordered)]
-            for f in cf.as_completed(futs):
-                f.result()
+        # Priority waves: tasks with the same `priority` value run in
+        # parallel; the next priority bucket only starts after the current
+        # one fully drains. The Planner uses priority to encode
+        # producer→consumer dependencies (HARD RULE 6 in PLANNER_SYS), so
+        # this is what makes those dependencies actually take effect at
+        # dispatch time. Previously the pool drained all priorities at once
+        # and consumers raced their producers — see 2026-05-25 1-iter test
+        # (3/17 done with single-file split because deps never landed).
+        waves: dict[int, list[Task]] = defaultdict(list)
+        for t in ordered:
+            waves[t.priority].append(t)
+        for prio in sorted(waves.keys()):
+            group = waves[prio]
+            workers = max(1, min(self.cfg.parallel_executors, len(group)))
+            log.info("Priority wave %d: %d task(s), parallel=%d",
+                     prio, len(group), workers)
+            with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = [pool.submit(_run, i, t) for i, t in enumerate(group)]
+                for f in cf.as_completed(futs):
+                    f.result()
         return results
 
     def _dump(self, name: str, payload: Any) -> None:

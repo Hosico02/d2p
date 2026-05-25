@@ -1343,7 +1343,7 @@ class TestPlannerFeatureCap(unittest.TestCase):
         user_prompt = args[1] if len(args) > 1 else kwargs.get("user", "")
         # When feature_cap=1, both min_tasks and max_tasks collapse to 1
         # (the floor formula uses min(3, cap)).
-        self.assertIn("1 to 1 tasks", user_prompt)
+        self.assertIn("typical range 1-1", user_prompt)
         # Schema passed through so the model is forced into the right shape
         self.assertIn("schema", kwargs)
         self.assertEqual(kwargs["schema"]["properties"]["tasks"]["type"], "array")
