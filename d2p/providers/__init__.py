@@ -1,7 +1,29 @@
 """Provider factory + per-role default model maps.
 
-Pick a provider with env `D2P_PROVIDER=minimax|claude|codex` (default minimax).
-Per-role models can be overridden via env, e.g. `D2P_ROLE_EXECUTOR_MODEL=...`.
+Pick a provider with env `D2P_PROVIDER=minimax|claude|codex|claude-cli`
+(default minimax). Per-role models can be overridden via env, e.g.
+`D2P_ROLE_EXECUTOR_MODEL=...`.
+
+RECOMMENDED CONFIGURATION (2026-05-26 benchmark):
+  Single-model Opus across ALL roles, including executor. Empirical bench
+  on 11 hand-curated bug-fix tasks (just_test/bugs_tier.json tier=1):
+    - MiniMax-M2.7-highspeed (executor): 7-8/11 (3 deterministic failures)
+    - claude-cli opus (executor):       11/11 ✓
+  The 3 deterministic failures (guard-cannot-repeat, mode-validation,
+  player-context-compression) require the reasoning depth Opus provides.
+  Cheaper tiers (haiku/M2.7-hs) work for ~70-80% of tasks but hit a
+  capability ceiling on the rest.
+
+  To enable Opus everywhere with claude-cli:
+    D2P_PROVIDER=claude-cli \\
+    D2P_ROLE_EXECUTOR_MODEL=opus \\
+    D2P_ROLE_FIX_MODEL=opus \\
+    python run.py <demo>
+  (analyzer/planner/qa/verify already default to opus under claude-cli.)
+
+  Cheaper providers (MiniMax / DeepSeek / haiku / sonnet) remain fully
+  supported — the defaults below preserve them. Lift to Opus only when
+  you need the last ~20pp on hard reasoning tasks.
 """
 from __future__ import annotations
 
