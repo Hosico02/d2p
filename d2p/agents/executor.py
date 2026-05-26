@@ -173,6 +173,12 @@ class Executor:
         No sandbox writes. Safe to call concurrently without locks because
         sandbox.read is read-only.
         """
+        from d2p._invariants import require
+        require(bool(task.id), "task.id must be non-empty",
+                task_title=task.title[:60])
+        require(isinstance(task.target_files, list),
+                "task.target_files must be a list",
+                task_id=task.id, got_type=type(task.target_files).__name__)
         files_block_parts = []
         source_snapshot: dict[str, str] = {}
         for rel in task.target_files[:6]:
@@ -568,6 +574,11 @@ class Executor:
         """Single self-heal attempt with `llm`. Returns True iff the file
         parses cleanly after the write.
         """
+        from d2p._invariants import require
+        require(bool(rel), "self-heal target file must be a non-empty path",
+                task_id=task.id)
+        require(bool(syntax_err), "self-heal must be called with a syntax error",
+                rel=rel, task_id=task.id)
         if self.usage is not None:
             self.usage.increment("self_heal_attempts")
         broken = prior_state if prior_state is not None else self.sandbox.read(rel)

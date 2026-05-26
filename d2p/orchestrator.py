@@ -174,6 +174,26 @@ class Orchestrator:
         self.enable_qa = enable_qa
         self.use_analyzer_cache = use_analyzer_cache
         self.sandbox = Sandbox(target_dir)
+        # Resolve run_dir + attach the per-run log file BEFORE any heavy
+        # initialization, so early diagnostics (LLM routing, QA setup) land
+        # in <run_dir>/d2p.log too. The stderr handler is already installed
+        # by run.py (or any other entry point that called _logging.configure).
+        if resume_from is not None:
+            self.run_dir = Path(resume_from).resolve()
+            if not self.run_dir.is_dir():
+                raise FileNotFoundError(f"resume_from not a dir: {self.run_dir}")
+        else:
+            self.run_dir = self.sandbox.root / ".d2p" / time.strftime("run-%Y%m%d-%H%M%S")
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+        self._resume = resume_from is not None
+        try:
+            from d2p._logging import attach_run_log
+            attach_run_log(self.run_dir)
+        except Exception as e:  # pragma: no cover — never block on logging
+            log.warning("could not attach per-run log file: %s", e)
+        if self._resume:
+            log.info("Resuming from %s", self.run_dir)
+
         # Per-role LLM router — Haiku/mini for hot path, Opus/4o for reasoning.
         # Defaults pulled from D2P_PROVIDER / role env overrides.
         # working_dir is needed for claude-cli (subprocess cwd).
@@ -196,20 +216,6 @@ class Orchestrator:
         self._verify_streak: int = 0
         self._verify_terminal_state: str | None = None
         self.health = ProjectHealth(self.sandbox)
-        # Resume from a prior run_dir vs start a fresh one. On resume, we
-        # reuse the existing dir (so per-iter JSON dumps accumulate) and
-        # mark `resume_from_iter` so run() knows to rebuild history from
-        # the per-iter files on disk. On fresh start, mkdir a new
-        # timestamped dir as before.
-        if resume_from is not None:
-            self.run_dir = Path(resume_from).resolve()
-            if not self.run_dir.is_dir():
-                raise FileNotFoundError(f"resume_from not a dir: {self.run_dir}")
-            log.info("Resuming from %s", self.run_dir)
-        else:
-            self.run_dir = self.sandbox.root / ".d2p" / time.strftime("run-%Y%m%d-%H%M%S")
-            self.run_dir.mkdir(parents=True, exist_ok=True)
-        self._resume = resume_from is not None
         # Background thread pool for prefetching next-iter Analyzer.run()
         # while the current iter's executor/qa/fix work runs. Saves the
         # ~50-70s Analyzer wait when --reanalyze-every is set.
@@ -1358,6 +1364,7 @@ class Orchestrator:
         return self.sandbox.root / ".d2p" / "feature_queue.json"
 
     def _load_feature_queue(self) -> list[Task]:
+        from d2p._invariants import invariant
         path = self._feature_queue_path
         if not path.is_file():
             return []
@@ -1382,6 +1389,17 @@ class Orchestrator:
                     tier_idx=int(d.get("tier_idx", 0) or 0),
                     attempts=list(d.get("attempts") or []),
                 ))
+        # Sanity-check loaded queue: no negative tier_idx, no duplicate
+        # task ids. Ladder upper bound is checked at dispatch time when we
+        # know which role's ladder applies.
+        for t in out:
+            invariant(t.tier_idx >= 0,
+                      "feature_queue entry has negative tier_idx",
+                      task_id=t.id, tier_idx=t.tier_idx)
+        ids_seen = [t.id for t in out]
+        invariant(len(ids_seen) == len(set(ids_seen)),
+                  "feature_queue has duplicate task ids",
+                  ids=ids_seen)
         return out
 
     def _save_feature_queue(self, tasks: list[Task]) -> None:
@@ -1401,6 +1419,13 @@ class Orchestrator:
         - failed + at top tier with attempts_at_top < MAX_TOP_TIER_RETRIES → keep, retry same tier
         - failed + at top tier with attempts_at_top >= MAX_TOP_TIER_RETRIES → drop (dead)
         """
+        from d2p._invariants import require, ensure
+        require(ladder_len >= 1, "ladder_len must be positive",
+                ladder_len=ladder_len, task_id=task.id)
+        require(0 <= task.tier_idx < ladder_len,
+                "task.tier_idx out of ladder range before advance",
+                tier_idx=task.tier_idx, ladder_len=ladder_len, task_id=task.id)
+        tier_before = task.tier_idx
         task.attempts.append({
             "tier_idx": task.tier_idx,
             "iteration": self._current_iter,
@@ -1413,6 +1438,12 @@ class Orchestrator:
         top_tier = max(0, ladder_len - 1)
         if task.tier_idx < top_tier:
             task.tier_idx += 1
+            ensure(task.tier_idx > tier_before,
+                   "tier_idx must increase when bumping below top tier",
+                   before=tier_before, after=task.tier_idx, task_id=task.id)
+            ensure(task.tier_idx < ladder_len,
+                   "tier_idx must stay within ladder after bump",
+                   tier_idx=task.tier_idx, ladder_len=ladder_len, task_id=task.id)
             return task
         # At the top tier already — count attempts at this tier
         top_attempts = sum(1 for a in task.attempts
@@ -1421,7 +1452,9 @@ class Orchestrator:
             log.info("task %s [%s] marked dead after %d top-tier retries",
                      task.id, task.title[:60], top_attempts)
             return None
-        # Keep at top tier for another retry
+        ensure(task.tier_idx == tier_before,
+               "tier_idx must not change when retrying at top",
+               before=tier_before, after=task.tier_idx, task_id=task.id)
         return task
 
     def _reload_history(self) -> tuple[list[dict[str, Any]], int, list[dict[str, Any]]]:

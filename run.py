@@ -6,6 +6,7 @@ import logging
 import pathlib
 import sys
 
+from d2p._logging import configure as configure_logging
 from d2p.config import Config
 from d2p.hub_client import HubClient
 from d2p.orchestrator import Orchestrator
@@ -77,11 +78,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s | %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    configure_logging(verbose=args.verbose)
 
     cfg = Config()
     cfg.reanalyze_every = args.reanalyze_every

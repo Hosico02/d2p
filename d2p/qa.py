@@ -516,20 +516,27 @@ class QAAgent:
         """Increment the attempt counter for a still-failing bug after a fix
         round. Returns the new attempt count. Used by orchestrator to decide
         whether to retire the bug (mark wontfix)."""
+        from d2p._invariants import ensure
         with self._meta_lock:
             prior = self._load_meta()
             if test_path not in prior:
                 return 0
-            n = int(prior[test_path].get("attempts", 0) or 0) + 1
+            old = int(prior[test_path].get("attempts", 0) or 0)
+            n = old + 1
             prior[test_path]["attempts"] = n
             self.sandbox.write(f"{self.corpus_dir}/_meta.json",
                                json.dumps(prior, ensure_ascii=False, indent=2))
+            ensure(n == old + 1, "attempts must increment by exactly 1",
+                   test_path=test_path, old=old, new=n)
             return n
 
     def bump_tier(self, test_path: str, *, top_tier: int) -> int:
         """Bump tier_idx by 1, capped at top_tier. Returns the new tier_idx.
         Used after a failed fix attempt so the next iter retries this bug
         with the next-stronger model in the ladder."""
+        from d2p._invariants import require, ensure
+        require(top_tier >= 0, "top_tier must be non-negative",
+                test_path=test_path, top_tier=top_tier)
         with self._meta_lock:
             prior = self._load_meta()
             if test_path not in prior:
@@ -539,6 +546,10 @@ class QAAgent:
             prior[test_path]["tier_idx"] = new
             self.sandbox.write(f"{self.corpus_dir}/_meta.json",
                                json.dumps(prior, ensure_ascii=False, indent=2))
+            ensure(new >= cur, "tier_idx must be monotonically non-decreasing",
+                   test_path=test_path, cur=cur, new=new)
+            ensure(new <= top_tier, "tier_idx must not exceed top_tier",
+                   test_path=test_path, new=new, top_tier=top_tier)
             return new
 
     def mark_wontfix(self, test_path: str) -> None:

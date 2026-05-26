@@ -215,9 +215,19 @@ class RoleRouter:
         is configured for the role, falls back to for_role. tier_idx is
         clamped to [0, len(ladder)-1] so callers can pass an arbitrary
         bumped index without bounds-checking themselves."""
+        from d2p._invariants import require
+        require(tier_idx >= 0, "tier_idx must be non-negative",
+                role=role, tier_idx=tier_idx)
         ladder = self._ladders.get(role)
         if not ladder:
             return self.for_role(role)
+        if tier_idx >= len(ladder):
+            # Over-top is tolerated by API contract, but a real symptom that
+            # the orchestrator bumped past the top. Log so it's grep-able.
+            import logging as _logging
+            _logging.getLogger("d2p.providers").debug(
+                "for_role_tier(%s, %d) clamped to top tier %d",
+                role, tier_idx, len(ladder) - 1)
         clamped = max(0, min(tier_idx, len(ladder) - 1))
         return ladder[clamped]
 
