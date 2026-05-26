@@ -13,7 +13,6 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 from d2p.agents.verifier import PreEvidence
 from d2p.fs import Sandbox

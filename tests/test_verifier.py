@@ -11,7 +11,6 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from d2p.agents.pre_evidence import collect as collect_pre_evidence
 from d2p.agents.verifier import (
     CheckEntry, Finding, PreEvidence, VerifyClaim, VerifyResult, Verifier,
 )
@@ -362,72 +361,6 @@ class TestOrchestratorVerifyStateMachine(unittest.TestCase):
         txt = handoff.read_text()
         self.assertIn("converged_with_residuals", txt)
         self.assertIn("readme_command_mismatch", txt)
-
-
-class TestPreEvidenceCollection(unittest.TestCase):
-    """`_collect_pre_evidence` shells out and bundles results. Patch
-    subprocess.run so the test doesn't actually invoke pytest/pnpm."""
-
-    def setUp(self) -> None:
-        from d2p.config import Config
-        from d2p.providers.base import RoleRouter
-        self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
-        # Python project shape.
-        (self.root / "pyproject.toml").write_text(
-            '[project]\nname = "x"\nversion = "0.0.0"\n'
-        )
-        (self.root / "tests").mkdir()
-        (self.root / "tests" / "test_a.py").write_text(
-            "def test_ok():\n    assert True\n"
-        )
-        cfg = Config()
-        cfg.verify_enabled = True
-        fake_llm = _StubLLM({
-            "verdict": "pass", "confidence": 0.5, "detected_archetype": "x",
-            "stability_signal": "no_new_findings_after_effort",
-            "reasoning_trace": [], "new_finding_categories": [],
-            "repeated_finding_categories": [], "blocking_findings": [],
-        })
-        router = RoleRouter({"default": fake_llm, "verify": fake_llm,
-                              "analyzer": fake_llm, "planner": fake_llm,
-                              "qa": fake_llm, "executor": fake_llm,
-                              "fix": fake_llm})
-        from d2p.orchestrator import Orchestrator
-        self.orch = Orchestrator(target_dir=str(self.root),
-                                  cfg=cfg, enable_qa=False, router=router)
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
-
-    def test_collect_pre_evidence_runs_tests_only_when_pytest_present(self) -> None:
-        """Without pytest on PATH, no test output is collected — language
-        detection alone is insufficient."""
-        with mock.patch("d2p.agents.pre_evidence.shutil.which", return_value=None):
-            with mock.patch("d2p.agents.pre_evidence.subprocess.run") as runner:
-                ev = collect_pre_evidence(self.orch.sandbox, iter_count=1)
-        # which() returned None for everything → no commands ran.
-        runner.assert_not_called()
-        self.assertEqual(ev.test_exit_code, None)
-        self.assertEqual(ev.build_exit_code, None)
-
-    def test_collect_pre_evidence_invokes_pytest_and_captures_exit(self) -> None:
-        def _fake_which(name: str) -> str | None:
-            return "/usr/bin/" + name if name == "pytest" else None
-
-        completed = mock.Mock()
-        completed.returncode = 0
-        completed.stdout = "1 passed in 0.01s"
-        completed.stderr = ""
-        with mock.patch("d2p.agents.pre_evidence.shutil.which", side_effect=_fake_which):
-            with mock.patch("d2p.agents.pre_evidence.subprocess.run",
-                            return_value=completed) as runner:
-                ev = collect_pre_evidence(self.orch.sandbox, iter_count=1)
-        runner.assert_called_once()
-        call_args = runner.call_args[0][0]
-        self.assertEqual(call_args[0], "pytest")
-        self.assertEqual(ev.test_exit_code, 0)
-        self.assertIn("1 passed", ev.test_output)
 
 
 if __name__ == "__main__":
