@@ -11,6 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from d2p.agents.pre_evidence import collect as collect_pre_evidence
 from d2p.agents.verifier import (
     CheckEntry, Finding, PreEvidence, VerifyClaim, VerifyResult, Verifier,
 )
@@ -402,9 +403,9 @@ class TestPreEvidenceCollection(unittest.TestCase):
     def test_collect_pre_evidence_runs_tests_only_when_pytest_present(self) -> None:
         """Without pytest on PATH, no test output is collected — language
         detection alone is insufficient."""
-        with mock.patch("d2p.orchestrator.shutil.which", return_value=None):
-            with mock.patch("d2p.orchestrator.subprocess.run") as runner:
-                ev = self.orch._collect_pre_evidence(iter_count=1)
+        with mock.patch("d2p.agents.pre_evidence.shutil.which", return_value=None):
+            with mock.patch("d2p.agents.pre_evidence.subprocess.run") as runner:
+                ev = collect_pre_evidence(self.orch.sandbox, iter_count=1)
         # which() returned None for everything → no commands ran.
         runner.assert_not_called()
         self.assertEqual(ev.test_exit_code, None)
@@ -418,10 +419,10 @@ class TestPreEvidenceCollection(unittest.TestCase):
         completed.returncode = 0
         completed.stdout = "1 passed in 0.01s"
         completed.stderr = ""
-        with mock.patch("d2p.orchestrator.shutil.which", side_effect=_fake_which):
-            with mock.patch("d2p.orchestrator.subprocess.run",
+        with mock.patch("d2p.agents.pre_evidence.shutil.which", side_effect=_fake_which):
+            with mock.patch("d2p.agents.pre_evidence.subprocess.run",
                             return_value=completed) as runner:
-                ev = self.orch._collect_pre_evidence(iter_count=1)
+                ev = collect_pre_evidence(self.orch.sandbox, iter_count=1)
         runner.assert_called_once()
         call_args = runner.call_args[0][0]
         self.assertEqual(call_args[0], "pytest")

@@ -4,8 +4,6 @@ from __future__ import annotations
 import concurrent.futures as cf
 import json
 import os
-import shutil
-import subprocess
 import uuid
 import logging
 import threading
@@ -16,8 +14,9 @@ from pathlib import Path
 from typing import Any, cast
 
 from .agents import Analyzer, Executor, Planner
+from .agents.pre_evidence import collect as collect_pre_evidence
 from .agents.verifier import (
-    PreEvidence, VerifyClaim, VerifyResult, Verifier,
+    VerifyClaim, VerifyResult, Verifier,
 )
 from .config import Config
 from .fs import Sandbox
@@ -643,7 +642,7 @@ class Orchestrator:
             # via the legacy zero-progress fallback below.
             if self.verifier is not None:
                 _t = time.monotonic()
-                pre_evidence = self._collect_pre_evidence(iter_count=it)
+                pre_evidence = collect_pre_evidence(self.sandbox, iter_count=it)
                 claim = VerifyClaim(
                     iter_count=it,
                     no_more_features=(done == 0 and not next_queue),
@@ -780,108 +779,6 @@ class Orchestrator:
     # ---------------------------------------------------------------- internal
 
     # ---- verify helpers -------------------------------------------------- #
-
-    # Per-command timeout when running test/build/typecheck for pre-evidence.
-    # 90s strikes a balance — long enough for medium pytest suites, short
-    # enough that a hung command doesn't gate verify forever.
-    _PRE_EVIDENCE_TIMEOUT_S = 90
-
-    def _collect_pre_evidence(self, *, iter_count: int) -> PreEvidence:
-        """Run tests / build / typecheck / git-diff and bundle outputs.
-        Verifier never invokes execution itself — d2p does it and hands
-        the verifier the evidence."""
-        root = str(self.sandbox.root)
-        listing = set(self.sandbox.listing(max_entries=400))
-        is_python = ("pyproject.toml" in listing or "setup.py" in listing
-                     or "requirements.txt" in listing
-                     or any(p.endswith(".py") for p in listing))
-        is_node = "package.json" in listing
-        is_rust = "Cargo.toml" in listing
-        is_go = "go.mod" in listing
-
-        evidence = PreEvidence()
-
-        # Tests
-        test_cmd = None
-        if is_python and shutil.which("pytest"):
-            test_cmd = ["pytest", "-q", "--maxfail=20"]
-        elif is_node:
-            mgr = "pnpm" if "pnpm-lock.yaml" in listing else "npm"
-            if shutil.which(mgr):
-                test_cmd = [mgr, "test", "--silent"] if mgr == "npm" else [mgr, "test"]
-        elif is_rust and shutil.which("cargo"):
-            test_cmd = ["cargo", "test", "--quiet"]
-        elif is_go and shutil.which("go"):
-            test_cmd = ["go", "test", "./..."]
-        if test_cmd:
-            evidence.test_output, evidence.test_exit_code = self._run_cmd(
-                test_cmd, cwd=root)
-
-        # Build
-        build_cmd = None
-        if is_node and shutil.which("pnpm" if "pnpm-lock.yaml" in listing else "npm"):
-            mgr = "pnpm" if "pnpm-lock.yaml" in listing else "npm"
-            # Probe package.json for a build script before invoking.
-            pkg_txt = self.sandbox.read("package.json")
-            if pkg_txt and '"build"' in pkg_txt:
-                build_cmd = [mgr, "run", "build"]
-        elif is_rust and shutil.which("cargo"):
-            build_cmd = ["cargo", "build", "--quiet"]
-        elif is_go and shutil.which("go"):
-            build_cmd = ["go", "build", "./..."]
-        if build_cmd:
-            evidence.build_output, evidence.build_exit_code = self._run_cmd(
-                build_cmd, cwd=root)
-
-        # Typecheck
-        typecheck_cmd = None
-        if is_python and shutil.which("mypy"):
-            typecheck_cmd = ["mypy", "--ignore-missing-imports",
-                             "--no-error-summary", "."]
-        elif is_node and "tsconfig.json" in listing:
-            mgr = "pnpm" if "pnpm-lock.yaml" in listing else "npx"
-            if shutil.which(mgr):
-                typecheck_cmd = [mgr, "tsc", "--noEmit"]
-        if typecheck_cmd:
-            evidence.typecheck_output, evidence.typecheck_exit_code = (
-                self._run_cmd(typecheck_cmd, cwd=root))
-
-        # Git diff: only meaningful if target is a git repo.
-        if (Path(root) / ".git").is_dir() and shutil.which("git"):
-            # iter_count is iterations executed this run. Walk back that
-            # many commits if available; fall back to HEAD diff if not.
-            n = max(1, iter_count)
-            out, code = self._run_cmd(
-                ["git", "diff", f"HEAD~{n}..HEAD"], cwd=root)
-            if code != 0:
-                # Not enough history — fall back to working-tree diff.
-                out, _ = self._run_cmd(["git", "diff", "HEAD"], cwd=root)
-            evidence.git_diff_recent = out
-
-        return evidence
-
-    def _run_cmd(self, cmd: list[str], *, cwd: str) -> tuple[str, int]:
-        """Run a command with a hard timeout. Returns (combined_output, exit_code).
-        Exit code 124 used for timeout (matching `timeout(1)` convention).
-        Never raises — the verifier needs to see whatever happened, even if
-        the command didn't exist or hung."""
-        try:
-            p = subprocess.run(
-                cmd, cwd=cwd, capture_output=True, text=True,
-                timeout=self._PRE_EVIDENCE_TIMEOUT_S,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
-            )
-            return ((p.stdout + ("\n" + p.stderr if p.stderr else "")).rstrip(),
-                    int(p.returncode))
-        except subprocess.TimeoutExpired as e:
-            return (f"<timed out after {self._PRE_EVIDENCE_TIMEOUT_S}s: "
-                    f"{' '.join(cmd)}>\n{(e.stdout or b'').decode(errors='replace')}",
-                    124)
-        except FileNotFoundError:
-            return (f"<command not found: {cmd[0]}>", 127)
-        except Exception as e:
-            return (f"<unexpected error running {cmd!r}: "
-                    f"{type(e).__name__}: {e}>", 1)
 
     def _write_handoff_report(self, findings, *, reason: str) -> None:
         """Persist a human-readable handoff for TERMINATE_WITH_RESIDUALS or
