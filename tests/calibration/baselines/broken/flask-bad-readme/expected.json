@@ -1,0 +1,8 @@
+{
+  "name": "flask-bad-readme",
+  "kind": "broken",
+  "archetype": "python-api",
+  "expected_verdict_in": ["needs_repair", "fail"],
+  "expected_categories_any_of": ["readme", "documentation"],
+  "notes": "README says `pnpm test`; project is Python — should flag command/language mismatch"
+}

@@ -1,0 +1,17 @@
+{
+  "name": "node-lib-unpinned-deps",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "lodash": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5",
+    "vitest": "*"
+  }
+}

@@ -33,3 +33,6 @@ docs/
 # Local scratch dirs (not for upstream)
 just_test/
 paper/
+
+# Calibration harness reports (gitignored; commit manually to docs/calibration/)
+tests/calibration/reports/

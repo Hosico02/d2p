@@ -1,0 +1,8 @@
+{
+  "name": "python-cli-clean",
+  "kind": "productized",
+  "archetype": "python-cli",
+  "expected_verdict_in": ["pass", "no_new_findings"],
+  "expected_categories_any_of": [],
+  "notes": "argparse CLI with --help, pytest tests passing, mypy clean (typed), README, pinned deps"
+}

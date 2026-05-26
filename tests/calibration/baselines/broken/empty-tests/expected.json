@@ -1,0 +1,8 @@
+{
+  "name": "empty-tests",
+  "kind": "broken",
+  "archetype": "python-lib",
+  "expected_verdict_in": ["needs_repair", "fail"],
+  "expected_categories_any_of": ["test", "assertion", "anti_gaming", "trivial"],
+  "notes": "5 tests that just `assert True`; src/lib.py is uncovered. Verifier should flag anti-gaming test pattern"
+}

@@ -1,0 +1,8 @@
+{
+  "name": "fastapi-no-error-envelope",
+  "kind": "broken",
+  "archetype": "python-api",
+  "expected_verdict_in": ["needs_repair", "fail"],
+  "expected_categories_any_of": ["error", "envelope", "exception"],
+  "notes": "All routes 200 OK even for missing IDs; no @app.exception_handler — verifier should flag missing standardised error responses"
+}

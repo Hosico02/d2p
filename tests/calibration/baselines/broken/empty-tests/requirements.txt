@@ -1,0 +1,1 @@
+# stdlib-only; tests use pytest from venv
