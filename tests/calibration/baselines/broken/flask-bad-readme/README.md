@@ -13,6 +13,3 @@ python app.py
 ```
 pnpm test
 ```
-
-(The README is wrong on purpose — this is a calibration baseline. The
-verifier should catch the README/project-language mismatch.)

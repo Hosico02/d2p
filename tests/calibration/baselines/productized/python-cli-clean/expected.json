@@ -4,5 +4,5 @@
   "archetype": "python-cli",
   "expected_verdict_in": ["pass", "no_new_findings"],
   "expected_categories_any_of": [],
-  "notes": "argparse CLI with --help, pytest tests passing, mypy clean (typed), README, pinned deps"
+  "notes": "argparse CLI with --help, type-annotated, pytest tests passing, README, pinned deps"
 }

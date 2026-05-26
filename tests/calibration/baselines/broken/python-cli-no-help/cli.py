@@ -1,5 +1,4 @@
-"""Greeter CLI. Takes one positional arg, prints `Hello, NAME`.
-No argparse, no --help; this is the seeded defect."""
+"""Greeter CLI."""
 import sys
 
 

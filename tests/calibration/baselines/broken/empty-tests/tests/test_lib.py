@@ -1,6 +1,4 @@
-"""These tests are deliberately empty — they assert True without
-exercising the lib. This is the anti-gaming pattern the verifier
-should detect."""
+"""Unit tests for lib."""
 
 
 def test_add() -> None:
