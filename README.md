@@ -1,6 +1,11 @@
-# d2p — Demo to Product
+# MatrixOmnix Forge — Demo to Project
 
-[![CI](https://github.com/Hosico02/d2p/actions/workflows/ci.yml/badge.svg)](https://github.com/Hosico02/d2p/actions/workflows/ci.yml)
+[![CI](https://github.com/Hosico02/matrixomnix-forge/actions/workflows/ci.yml/badge.svg)](https://github.com/Hosico02/matrixomnix-forge/actions/workflows/ci.yml)
+
+*MatrixOmnix Forge (formerly `d2p`) is the iterative demo-to-project agent in
+the MatrixOmnix toolchain, pairing with MatrixOmnix HUB for orchestration.
+Package name (`d2p/`), env vars (`D2P_*`), and on-disk paths (`.d2p/`,
+`tests/d2p_qa/`) are kept as-is for backward compatibility.*
 
 A multi-agent loop that turns a **demo repo** into a **product repo**. No
 hardcoded "demo type" detectors — the agents read the project, search the
@@ -229,10 +234,11 @@ spelunk JSON to know what a run cost.
 - **Forbidden files**: fix tasks include the bug-test path in
   `forbidden_files`; the executor refuses writes to it.
 
-For comparison: the older sibling project [MatrixOmnix](https://github.com/) (`demo2project`) hard-codes
-60+ gap detectors + per-detector planner cases + per-task executor handlers,
-totalling ~20k LOC. This project is the deliberately-minimal alternative
-where the agents themselves do that work.
+For comparison: the predecessor codebase [`demo2project`](https://github.com/)
+(now evolving into **MatrixOmnix HUB**) hard-codes 60+ gap detectors +
+per-detector planner cases + per-task executor handlers, totalling ~20k LOC.
+Forge is the deliberately-minimal alternative where the agents themselves do
+that work.
 
 ---
 
@@ -362,7 +368,7 @@ orchestrator stops dispatching the same broken fix forever.
 ### Analyzer caching
 
 The Analyzer call is slow (web search + JSON-mode reasoning over the
-whole codebase) and largely deterministic for a stable codebase. d2p
+whole codebase) and largely deterministic for a stable codebase. Forge
 fingerprints the analyzer's input (`listing + key file contents + model
 identity + system prompt`) and stores results in
 `<target>/.d2p/analysis_cache.json`. Subsequent runs against the same
@@ -379,7 +385,7 @@ findings).
   forbidden-test guards prevent silent damage but cannot turn a bad
   generation into a good one. Multi-iteration helps.
 - **No score**, no "production_ready" badge. The product is ready when
-  *its own tests pass and you accept the result* — d2p doesn't pretend to
+  *its own tests pass and you accept the result* — Forge doesn't pretend to
   know your bar.
 - **Web search via the provider.** Analyzer uses the model's built-in web
   capability where available. If you wire in a provider without web access,
