@@ -1,0 +1,8 @@
+{
+  "name": "flask-clean",
+  "kind": "productized",
+  "archetype": "python-api",
+  "expected_verdict_in": ["pass", "no_new_findings"],
+  "expected_categories_any_of": [],
+  "notes": "Flask app with @app.errorhandler, JSON error envelopes, pinned deps, README, tests passing"
+}

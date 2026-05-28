@@ -27,5 +27,14 @@ __pycache__/
 *.zip
 稳定版*.zip
 
-# Local-only working docs (session digests, plan scratch, etc.)
-docs/
+# Local-only working docs (session digests, plan scratch, etc.).
+# Calibration results are an exception — committed under docs/calibration/.
+docs/*
+!docs/calibration/
+
+# Local scratch dirs (not for upstream)
+just_test/
+paper/
+
+# Calibration harness reports (gitignored; commit manually to docs/calibration/)
+tests/calibration/reports/

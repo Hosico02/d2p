@@ -44,7 +44,8 @@ def _parse_race_roles(spec: str) -> set[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="d2p — turn a demo into a product")
+    p = argparse.ArgumentParser(
+        description="MatrixOmnix Forge — turn a demo into a project")
     p.add_argument("target", help="path to the demo project directory")
     p.add_argument("--iter", type=int, default=2, help="max iterations (default 2)")
     p.add_argument("--parallel", type=int, default=4, help="parallel executors")

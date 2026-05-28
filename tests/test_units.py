@@ -389,6 +389,99 @@ class TestFlipMetaStatus(unittest.TestCase):
             self.assertEqual(meta, {})
 
 
+class _CapturingLLM:
+    """Fake LLM that records the last prompt and returns a canned reply."""
+    def __init__(self, reply: str = "") -> None:
+        self.reply = reply
+        self.last_user: str | None = None
+        self.last_system: str | None = None
+
+    def chat(self, system: str, user: str, **kw) -> str:
+        self.last_system = system
+        self.last_user = user
+        return self.reply
+
+
+def _make_probe_qa(root: Path, llm) -> object:
+    from d2p.qa import QAAgent
+    import threading as _th
+    sb = Sandbox(root)
+    qa = QAAgent.__new__(QAAgent)
+    qa.sandbox = sb
+    qa.corpus_dir = "tests/d2p_qa"
+    qa.checklist = [{"id": "input_validation", "desc": "validate inputs"}]
+    qa.llm = llm
+    qa.adapter = type("A", (), {
+        "name": "python",
+        "test_template": lambda self: "SKELETON",
+    })()
+    qa._meta_lock = _th.Lock()
+    return qa
+
+
+class TestProbeCrossIterMemory(unittest.TestCase):
+    """The bug-probe must carry semantic memory across iterations so it does
+    not re-surface problems already solved (fixed bugs) or re-derive
+    hypotheses already confirmed to be non-bugs."""
+
+    def test_probe_prompt_includes_existing_test_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "tests" / "d2p_qa").mkdir(parents=True)
+            (root / "tests" / "d2p_qa" / "_meta.json").write_text(json.dumps({
+                "tests/d2p_qa/test_guard.py": {
+                    "title": "guard cannot repeat the same action",
+                    "category": "concurrency", "status": "fixed",
+                    "test_path": "tests/d2p_qa/test_guard.py",
+                },
+            }))
+            llm = _CapturingLLM(reply="")
+            qa = _make_probe_qa(root, llm)
+            qa._probe_for_new_bugs(
+                analysis_summary="dom", essence="e", audience="a",
+                key_files_block="kf", symbol_map={},
+                existing_tests=["tests/d2p_qa/test_guard.py"],
+            )
+            self.assertIsNotNone(llm.last_user)
+            self.assertIn("guard cannot repeat the same action", llm.last_user)
+            self.assertIn("FIXED", llm.last_user)
+
+    def test_probe_prompt_includes_nonbug_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "tests" / "d2p_qa").mkdir(parents=True)
+            (root / "tests" / "d2p_qa" / "_probe_ledger.json").write_text(json.dumps([
+                {"title": "speed NaN is already rejected", "category": "input_validation",
+                 "suspected_files": ["game.py"], "checked_iter": 1},
+            ]))
+            llm = _CapturingLLM(reply="")
+            qa = _make_probe_qa(root, llm)
+            qa._probe_for_new_bugs(
+                analysis_summary="dom", essence="e", audience="a",
+                key_files_block="kf", symbol_map={},
+                existing_tests=[],
+            )
+            self.assertIsNotNone(llm.last_user)
+            self.assertIn("speed NaN is already rejected", llm.last_user)
+
+    def test_append_probe_ledger_dedups_by_title_category(self) -> None:
+        from d2p.qa import BugReport
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "tests" / "d2p_qa").mkdir(parents=True)
+            qa = _make_probe_qa(root, _CapturingLLM())
+            b = BugReport(id="1", title="X is already handled",
+                          test_path="tests/d2p_qa/test_x.py",
+                          category="error_handling", summary="")
+            qa._append_probe_ledger([b], iteration=2)
+            qa._append_probe_ledger([b], iteration=3)  # same title+category
+            ledger = json.loads(
+                (root / "tests/d2p_qa/_probe_ledger.json").read_text())
+            self.assertEqual(len(ledger), 1)
+            self.assertEqual(ledger[0]["title"], "X is already handled")
+            self.assertEqual(ledger[0]["checked_iter"], 2)
+
+
 class TestBaselineTestGate(unittest.TestCase):
     def test_discover_pre_existing_tests_excludes_d2p_qa(self) -> None:
         from d2p.orchestrator import _discover_pre_existing_tests

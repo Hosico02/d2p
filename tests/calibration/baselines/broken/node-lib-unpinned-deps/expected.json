@@ -1,0 +1,8 @@
+{
+  "name": "node-lib-unpinned-deps",
+  "kind": "broken",
+  "archetype": "node-lib",
+  "expected_verdict_in": ["needs_repair", "fail"],
+  "expected_categories_any_of": ["unpinned", "dependency", "version"],
+  "notes": "dependencies use `*` and `^` ranges — verifier should flag production deps not pinned"
+}

@@ -1,0 +1,8 @@
+{
+  "name": "python-cli-no-help",
+  "kind": "broken",
+  "archetype": "python-cli",
+  "expected_verdict_in": ["needs_repair", "fail"],
+  "expected_categories_any_of": ["cli", "help", "interface", "argparse"],
+  "notes": "CLI exists but has no --help; verifier should flag missing CLI contract"
+}

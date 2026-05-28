@@ -106,12 +106,25 @@ SUMMARY: <one short line>
 
 <one or more ===FILE=== and/or ===PATCH=== blocks>
 
-If you cannot or should not do the task:
+`STATUS: skipped` is a LAST RESORT, allowed ONLY in these cases:
+  - Every entry in `target_files` is also in `forbidden_files` (you have
+    literally nothing you're allowed to edit), OR
+  - The task instructions are empty / corrupt / self-contradictory in a
+    way no code change can resolve.
 
-STATUS: skipped
-SUMMARY: <why>
+In ALL other cases — including tasks that look "wrong", "ambiguous",
+"under-specified", "philosophically questionable", or "already mostly
+done" — you MUST attempt the smallest reasonable edit. Failure WITH
+code is signal; refusal WITHOUT code is wasted compute. If you skip a
+task whose target_files are non-forbidden and editable, you have broken
+the contract.
 
 Hard rules:
+- CODE-ONLY OUTPUT. Do not write explanatory prose, analysis, or
+  apologies. The parser drops everything that isn't in the STATUS /
+  SUMMARY / ===FILE=== / ===PATCH=== frame. Words spent explaining are
+  lost. If you have something to say about the change, put it in
+  SUMMARY (one line).
 - Only modify files inside `target_files`, plus you MAY create at most one
   extra helper file if essential.
 - Preserve the existing tech stack and style.

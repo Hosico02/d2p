@@ -1,0 +1,8 @@
+{
+  "name": "node-cli-clean",
+  "kind": "productized",
+  "archetype": "node-cli",
+  "expected_verdict_in": ["pass", "no_new_findings"],
+  "expected_categories_any_of": [],
+  "notes": "TS CLI with --help, vitest tests, strict tsconfig, pinned deps"
+}
