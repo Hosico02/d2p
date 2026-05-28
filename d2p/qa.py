@@ -188,8 +188,15 @@ Key source files:
 Symbol map:
 {symbol_map}
 
-Already-existing QA tests (do NOT duplicate these):
+Already-existing QA tests — each line is `<path> [STATUS] <hypothesis> (category)`.
+Do NOT write another test for any hypothesis already covered here. In
+particular, [FIXED] entries are SOLVED — do NOT re-probe them; a near-duplicate
+that asserts a slightly different facet just re-opens settled ground:
 {existing_tests}
+
+Already investigated and confirmed NOT bugs (the code already handles these
+correctly — a test for them would PASS and be discarded, so do NOT write one):
+{investigated_non_bugs}
 
 Emit one test per failing-bug hypothesis you can construct (typical 3-10). Do NOT pad and do NOT artificially limit yourself on the upper end — if you spot 8 distinct hypotheses, emit 8 tests. SOFT FLOOR: emit AT LEAST 2 tests unless you have audited the codebase end-to-end and are convinced no bug exists; on a fresh codebase you have not seen before, there are always at least 2 credible hypotheses (e.g. missing input validation, missing auth, race conditions, error paths). Each test must be likely to FAIL on the current code.
 """
@@ -382,12 +389,15 @@ class QAAgent:
                 ))
         dropped_self_broken = 0
         dropped_passing = 0
+        passing_nonbugs: list[BugReport] = []
         for br, outcome in confirm_outcomes:
             prior_runs[br.test_path] = outcome
             if outcome["status"] == "passed":
                 # bug-probe misjudged — test is green. Delete to keep the
-                # corpus clean.
+                # corpus clean, but record the hypothesis in the ledger so we
+                # don't re-derive this exact non-bug next iteration.
                 self.sandbox.delete(br.test_path)
+                passing_nonbugs.append(br)
                 dropped_passing += 1
                 continue
             if _test_is_self_broken(outcome.get("output", ""), br.test_path):
@@ -402,6 +412,7 @@ class QAAgent:
             br.last_failure = outcome["output"][-1500:]
             br.first_seen_iter = iteration
             confirmed_new.append(br)
+        self._append_probe_ledger(passing_nonbugs, iteration)
         log.info("QA bug-confirm: %d candidates -> %d real bugs in %.1fs "
                  "(dropped: %d self-broken, %d passing)",
                  len(new_bugs), len(confirmed_new),
@@ -481,6 +492,46 @@ class QAAgent:
             return json.loads(raw)
         except json.JSONDecodeError:
             return {}
+
+    _LEDGER_CAP = 60  # bound prompt growth on long runs
+
+    def _load_probe_ledger(self) -> list[dict[str, Any]]:
+        """Hypotheses the probe raised in prior iters that turned out NOT to
+        be bugs (their test passed at confirm time and was discarded). Without
+        this record the probe re-derives the same non-bug every iteration."""
+        raw = self.sandbox.read(f"{self.corpus_dir}/_probe_ledger.json")
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, list) else []
+        except json.JSONDecodeError:
+            return []
+
+    def _append_probe_ledger(self, entries: list[BugReport],
+                             iteration: int) -> None:
+        """Record confirmed non-bug hypotheses. Dedup by (title, category) so
+        the ledger doesn't bloat when the same hypothesis recurs. Called from
+        the single-threaded confirm loop, so no lock needed."""
+        if not entries:
+            return
+        ledger = self._load_probe_ledger()
+        seen = {((e.get("title") or "").strip().lower(), e.get("category") or "")
+                for e in ledger}
+        for b in entries:
+            key = (b.title.strip().lower(), b.category)
+            if key in seen:
+                continue
+            seen.add(key)
+            ledger.append({
+                "title": b.title,
+                "category": b.category,
+                "suspected_files": b.suspected_files,
+                "checked_iter": iteration,
+            })
+        ledger = ledger[-self._LEDGER_CAP:]
+        self.sandbox.write(f"{self.corpus_dir}/_probe_ledger.json",
+                           json.dumps(ledger, ensure_ascii=False, indent=2))
 
     def _save_meta(self, failing: list[BugReport],
                    fixed: list[BugReport]) -> None:
@@ -627,7 +678,25 @@ class QAAgent:
                             existing_tests: list[str]) -> list[BugReport]:
         listing = "\n".join(self.sandbox.listing(max_entries=160))
         checklist = json.dumps(self.checklist, ensure_ascii=False, indent=2)
-        existing_block = "\n".join(existing_tests) or "(none)"
+        # Semantic dedup signal: filenames alone are LLM-chosen slugs with no
+        # meaning, so the next iter re-probes the same ground under a new slug.
+        # Carry each existing test's hypothesis + status (esp. FIXED) so the
+        # probe can actually avoid re-surfacing solved problems.
+        meta = self._load_meta()
+
+        def _fmt_existing(rel: str) -> str:
+            m = meta.get(rel, {})
+            title = (m.get("title") or "").strip() or "(no recorded hypothesis)"
+            status = (m.get("status") or "open").upper()
+            cat = (m.get("category") or "?")
+            return f"- {rel} [{status}] {title} ({cat})"
+
+        existing_block = "\n".join(_fmt_existing(r) for r in existing_tests) \
+            or "(none)"
+        ledger = self._load_probe_ledger()
+        nonbug_block = "\n".join(
+            f"- {e.get('title', '')} ({e.get('category', '?')})" for e in ledger
+        ) or "(none)"
         user = QA_PROBE_USER_TMPL.format(
             root=str(self.sandbox.root),
             domain=analysis_summary,
@@ -641,6 +710,7 @@ class QAAgent:
             key_files=key_files_block,
             symbol_map=json.dumps(symbol_map, ensure_ascii=False, indent=2),
             existing_tests=existing_block,
+            investigated_non_bugs=nonbug_block,
         )
         try:
             raw = self.llm.chat(QA_PROBE_SYS, user, temperature=0.4,
