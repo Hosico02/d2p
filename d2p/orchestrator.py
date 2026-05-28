@@ -15,6 +15,7 @@ from typing import Any, cast
 
 from .agents import Analyzer, Executor, Planner
 from .agents.pre_evidence import collect as collect_pre_evidence
+from .calibration import load_snapshot as load_calibration_snapshot
 from .agents.verifier import (
     VerifyClaim, VerifyResult, Verifier,
 )
@@ -242,12 +243,19 @@ class Orchestrator:
         # Falls back to a fresh uuid for standalone runs.
         run_id = os.environ.get("D2P_RUN_ID") or str(uuid.uuid4())
         log.info("d2p starting on %s", self.sandbox.root)
+        # Canonical calibration snapshot for this Forge build (may be None if
+        # calibration has never been run). Surfaced in summary.json and to the
+        # Hub so orchestration can weight how far to trust this run's verdicts.
+        verifier_confidence = load_calibration_snapshot()
         if self.hub:
             try:
-                self.hub.push_event("run_started", run_id, {
+                started_payload: dict[str, Any] = {
                     "project_path": str(self.sandbox.root),
                     "started_at": datetime.now(timezone.utc).isoformat(),
-                })
+                }
+                if verifier_confidence is not None:
+                    started_payload["verifier_confidence"] = verifier_confidence
+                self.hub.push_event("run_started", run_id, started_payload)
             except Exception:
                 pass
         # Persistent analyzer cache keyed by codebase fingerprint. Lives
@@ -747,6 +755,7 @@ class Orchestrator:
                 "passes": [r.to_dict() for r in self._verify_results_this_run],
                 "streak_at_end": self._verify_streak,
             },
+            "verifier_confidence": verifier_confidence,
         }
         self._dump("summary.json", summary)
         # Render a self-contained HTML report alongside the JSON dump.

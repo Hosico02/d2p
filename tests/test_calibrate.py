@@ -299,6 +299,42 @@ class TestWriteReport(unittest.TestCase):
         self.assertIn("x", md)  # baseline name surfaces
 
 
+class TestSnapshot(unittest.TestCase):
+    def setUp(self) -> None:
+        import tempfile
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmpdir,
+                                                            ignore_errors=True))
+
+    def test_write_then_load_round_trips(self) -> None:
+        from d2p.calibration import write_snapshot, load_snapshot
+        m = Metrics(catch_rate=0.9, fp_rate=0.1, pass_on_broken=0,
+                    criteria_met=True, total_baselines=8, errors=0)
+        meta = {"model": "minimax-m2.7-hs", "started_at": "2026-05-26T16:00:00Z",
+                "harness_version": "v0"}
+        path = self.tmpdir / "latest.json"
+        write_snapshot(m, meta, path=path)
+        snap = load_snapshot(path=path)
+        self.assertIsNotNone(snap)
+        assert snap is not None
+        self.assertEqual(snap["catch_rate"], 0.9)
+        self.assertEqual(snap["fp_rate"], 0.1)
+        self.assertEqual(snap["pass_on_broken"], 0)
+        self.assertTrue(snap["criteria_met"])
+        self.assertEqual(snap["model"], "minimax-m2.7-hs")
+        self.assertEqual(snap["calibrated_at"], "2026-05-26T16:00:00Z")
+
+    def test_load_missing_file_returns_none(self) -> None:
+        from d2p.calibration import load_snapshot
+        self.assertIsNone(load_snapshot(path=self.tmpdir / "nope.json"))
+
+    def test_load_malformed_file_returns_none(self) -> None:
+        from d2p.calibration import load_snapshot
+        bad = self.tmpdir / "bad.json"
+        bad.write_text("{not json")
+        self.assertIsNone(load_snapshot(path=bad))
+
+
 class TestMainExitCode(unittest.TestCase):
     def test_criteria_met_returns_0(self) -> None:
         from d2p.calibration import _exit_code_for
