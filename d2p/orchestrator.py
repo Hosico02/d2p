@@ -16,6 +16,7 @@ from typing import Any, cast
 from .agents import Analyzer, Executor, Planner
 from .agents.pre_evidence import collect as collect_pre_evidence
 from .calibration import load_snapshot as load_calibration_snapshot
+from .narrative import build_iter_narrative
 from .agents.verifier import (
     VerifyClaim, VerifyResult, Verifier,
 )
@@ -637,9 +638,20 @@ class Orchestrator:
 
             if self.hub:
                 try:
+                    reanalyzed = bool(
+                        self.cfg.reanalyze_every and it > 1
+                        and (it - 1) % self.cfg.reanalyze_every == 0
+                    )
+                    narrative = build_iter_narrative(
+                        analysis=analysis, plan=plan, results=results,
+                        qa_report=qa_report, qa_fix_results=qa_fix_results,
+                        still_open_count=len(open_bugs),
+                        reanalyzed=reanalyzed,
+                    )
                     self.hub.push_event("iteration_complete", run_id, {
                         "iter_n": it,
                         "ended_at": datetime.now(timezone.utc).isoformat(),
+                        **narrative,
                     })
                 except Exception:
                     pass
