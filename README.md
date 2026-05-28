@@ -1,6 +1,6 @@
 # MatrixOmnix Forge — Demo to Project
 
-[![CI](https://github.com/Hosico02/matrixomnix-forge/actions/workflows/ci.yml/badge.svg)](https://github.com/Hosico02/matrixomnix-forge/actions/workflows/ci.yml)
+[![CI](https://github.com/anzy-renlab-ai/matrixomnix-forge/actions/workflows/ci.yml/badge.svg)](https://github.com/anzy-renlab-ai/matrixomnix-forge/actions/workflows/ci.yml)
 
 *MatrixOmnix Forge (formerly `d2p`) is the iterative demo-to-project agent in
 the MatrixOmnix toolchain, pairing with MatrixOmnix HUB for orchestration.
