@@ -31,6 +31,12 @@ OUTCOME_ERROR = "error"
 CATCH_THRESHOLD = 0.8
 FP_THRESHOLD = 0.2
 
+# Stable, committed snapshot of the most recent calibration. Read at run
+# time by the orchestrator to surface verifier confidence to summary.json
+# and the Hub. Path is relative to the Forge repo root (parent of the d2p
+# package) so it resolves regardless of the target demo's cwd.
+SNAPSHOT_PATH = Path(__file__).resolve().parent.parent / "docs" / "calibration" / "latest.json"
+
 
 @dataclass
 class Metrics:
@@ -222,6 +228,42 @@ def write_report(out_dir: Path, rows: list[dict], metrics: Metrics,
     (out_dir / "report.md").write_text(_render_md(rows, metrics, meta))
 
 
+def snapshot_dict(metrics: Metrics, meta: dict) -> dict[str, Any]:
+    """The compact 'verifier confidence' record persisted as the canonical
+    calibration snapshot and forwarded to the Hub. Flat + JSON-primitive so
+    it survives the HTTP contract and a SQLite row without translation."""
+    return {
+        "catch_rate": metrics.catch_rate,
+        "fp_rate": metrics.fp_rate,
+        "pass_on_broken": metrics.pass_on_broken,
+        "criteria_met": metrics.criteria_met,
+        "total_baselines": metrics.total_baselines,
+        "errors": metrics.errors,
+        "model": meta.get("model", ""),
+        "harness_version": meta.get("harness_version", "v0"),
+        "calibrated_at": meta.get("started_at", ""),
+    }
+
+
+def write_snapshot(metrics: Metrics, meta: dict,
+                   path: Path = SNAPSHOT_PATH) -> None:
+    """Overwrite the canonical calibration snapshot. Called by main() after a
+    real (non-dry-run) calibration so the committed confidence travels with
+    the code."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(snapshot_dict(metrics, meta), indent=2) + "\n")
+
+
+def load_snapshot(path: Path = SNAPSHOT_PATH) -> Optional[dict[str, Any]]:
+    """Read the canonical calibration snapshot for run-time reporting.
+    Fail-safe: returns None if the file is missing or unreadable so a run
+    never depends on calibration having been run."""
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def _render_md(rows: list[dict], metrics: Metrics, meta: dict) -> str:
     lines: list[str] = []
     lines.append(f"# Calibration report · {meta.get('started_at', '')}")
@@ -369,6 +411,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     }
     write_report(args.out, rows, metrics, meta)
     print(f"[calibrate] report -> {args.out}")
+    if not args.dry_run:
+        write_snapshot(metrics, meta)
+        print(f"[calibrate] snapshot -> {SNAPSHOT_PATH}")
     print(f"[calibrate] catch_rate={metrics.catch_rate:.2f} "
           f"fp_rate={metrics.fp_rate:.2f} "
           f"pass_on_broken={metrics.pass_on_broken} "

@@ -1,0 +1,11 @@
+{
+  "catch_rate": 1.0,
+  "fp_rate": 1.0,
+  "pass_on_broken": 0,
+  "criteria_met": false,
+  "total_baselines": 8,
+  "errors": 0,
+  "model": "minimax-m2.7-hs",
+  "harness_version": "v0",
+  "calibrated_at": "2026-05-26T12:06:08Z"
+}
